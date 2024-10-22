@@ -32,6 +32,7 @@ namespace PCNWSolrUploadFiles
 
         public static IHostBuilder CreateHostBuilder(string[] args) =>
             Host.CreateDefaultBuilder(args)
+            .UseWindowsService()
                 .UseSerilog((context, services, configuration) => configuration
                 .MinimumLevel.Information()
                 .MinimumLevel.Override("Microsoft.EntityFrameworkCore", LogEventLevel.Warning) 
@@ -55,6 +56,7 @@ namespace PCNWSolrUploadFiles
                     services.AddTransient<UploadController>();
                     services.AddHostedService<UploadWorkerService>();
 
-                });
+                })
+            ;
     }
 }
