@@ -16,10 +16,8 @@ namespace PCNWSolrUploadFiles
             {
                 Log.Information("Starting worker service...");
 
-                // Build the host for the worker service
                 var host = CreateHostBuilder(args).Build();
 
-                // Run the worker service
                 await host.RunAsync();
             }
             catch (Exception ex)
@@ -36,10 +34,10 @@ namespace PCNWSolrUploadFiles
             Host.CreateDefaultBuilder(args)
                 .UseSerilog((context, services, configuration) => configuration
                 .MinimumLevel.Information()
-                .MinimumLevel.Override("Microsoft.EntityFrameworkCore", LogEventLevel.Warning) // Filter out EF Core logs
+                .MinimumLevel.Override("Microsoft.EntityFrameworkCore", LogEventLevel.Warning) 
                 .WriteTo.Console()
                 .WriteTo.File("logs/log.txt", rollingInterval: RollingInterval.Day)
-                .Filter.ByExcluding(Matching.FromSource("Microsoft.EntityFrameworkCore")) // Exclude EF Core logs
+                .Filter.ByExcluding(Matching.FromSource("Microsoft.EntityFrameworkCore"))
             ) 
                 .ConfigureAppConfiguration((context, config) =>
                 {
@@ -54,7 +52,6 @@ namespace PCNWSolrUploadFiles
                     services.AddDbContext<PcnwprojectDbContext>(options =>
                 options.UseSqlServer(hostContext.Configuration.GetConnectionString("DefaultConnection")));
 
-                    // Register other services
                     services.AddTransient<UploadController>();
                     services.AddHostedService<UploadWorkerService>();
 

@@ -26,30 +26,31 @@ public class UploadWorkerService : BackgroundService
         while (!stoppingToken.IsCancellationRequested)
         {
             var now = DateTime.Now;
-            var nextRunTime = DateTime.Today.Add(_scheduleTime);
-            //var nextRunTime = DateTime.Now.Add(_scheduleTime);
+            var nextRunTime = DateTime.Today.AddHours(2);
 
             if (now > nextRunTime)
                 nextRunTime = nextRunTime.AddDays(1);
 
-            int a = 0;
-            var delay = (a > 1) ? nextRunTime - now : TimeSpan.Zero;
-            //var delay = nextRunTime - now;
+            // Run immediately 
+            int a = 0; // Change this to 1 for immediate execution, and 0 for production timing
+            var delay = (a > 0) ? TimeSpan.Zero : nextRunTime - now;
+
             _logger.LogInformation("Next run scheduled at: {time}", nextRunTime);
 
+            // Wait for the next run time or proceed immediately if `delay` is zero
             await Task.Delay(delay, stoppingToken);
 
             try
             {
-                _logger.LogInformation("Starting upload process at: {time}",DateTime.Now );
+                _logger.LogInformation("Starting upload process at: {time}", DateTime.Now);
 
                 using (var scope = _serviceProvider.CreateScope())
                 {
                     var uploadController = scope.ServiceProvider.GetRequiredService<UploadController>();
-                    await uploadController.UploadAllFiles();
+                    await uploadController.UploadAllFiles(); // Your upload process
                 }
 
-                _logger.LogInformation("Upload process completed successfully at: {time}",DateTime.Now);
+                _logger.LogInformation("Upload process completed successfully at: {time}", DateTime.Now);
             }
             catch (Exception ex)
             {
@@ -57,4 +58,4 @@ public class UploadWorkerService : BackgroundService
             }
         }
     }
-}
+

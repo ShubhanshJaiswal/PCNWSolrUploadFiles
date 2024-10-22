@@ -4,6 +4,9 @@ using PCNWSolrUploadFiles.Data;
 using System.Text;
 using System.Text.Json;
 using UglyToad.PdfPig;
+using UglyToad.PdfPig.Util;
+using Aspose.Words;
+
 
 namespace PCNWSolrUploadFiles.Controllers
 {
@@ -53,8 +56,6 @@ namespace PCNWSolrUploadFiles.Controllers
                         {
                             var projectNumber = Path.GetFileName(projectFolder);
 
-
-
                             _logger.LogInformation("Processing project: {projectNumber}", projectNumber);
 
                             var projectId = await _dbContext.Projects
@@ -75,11 +76,16 @@ namespace PCNWSolrUploadFiles.Controllers
 
                             lastIndexedDate = lastIndexedDate ?? DateTime.MinValue;
 
-                            var allowedExtensions = new[] { ".pdf", ".docx", ".txt" };
-                            var allFolders = Directory.GetDirectories(projectFolder, "*", SearchOption.AllDirectories); 
-
+                            var allowedExtensions = new[] { ".pdf", ".docx",".doc", ".txt" };
+                            var allFolders = Directory.GetDirectories(projectFolder, "*", SearchOption.AllDirectories);
+                            var success = false;
                             foreach (var folder in allFolders)
                             {
+                                //var files = Directory.GetFiles(folder);
+                                //foreach (var item in files)
+                                //{
+                                //    var ext = Path.GetExtension(item).ToLower();
+                                //}
                                 foreach (var filePath in Directory.GetFiles(folder).Where(file =>
                                             allowedExtensions.Contains(Path.GetExtension(file).ToLower()) &&
                                             File.GetCreationTime(file) > lastIndexedDate))
@@ -87,7 +93,7 @@ namespace PCNWSolrUploadFiles.Controllers
                                     _logger.LogInformation("Processing file: {filePath}", filePath);
 
                                     var folderType = Path.GetFileName(folder); 
-                                    var success = await ProcessFile(projectId, filePath, folderType); 
+                                    success = await ProcessFile(projectId, filePath, folderType); 
 
                                     if (!success)
                                     {
@@ -110,7 +116,7 @@ namespace PCNWSolrUploadFiles.Controllers
                             //}
 
                             var project = await _dbContext.Projects.FirstOrDefaultAsync(m => m.ProjId == projectId);
-                            if (project != null)
+                            if (project != null && success)
                             {
                                 project.IndexPdffiles = false;
                                 project.SolrIndexDt = DateTime.Now;
@@ -118,6 +124,10 @@ namespace PCNWSolrUploadFiles.Controllers
                                 await _dbContext.SaveChangesAsync();
 
                                 _logger.LogInformation("Project {projectNumber} successfully marked as indexed", projectNumber);
+                            }
+                            else if(!success)
+                            {
+                                _logger.LogInformation("Project {projectNumber} already marked as indexed", projectNumber);
                             }
                         }
 
@@ -165,6 +175,11 @@ namespace PCNWSolrUploadFiles.Controllers
                         }
                         break;
 
+                    case ".doc":
+                        Document doc = new Document(tempFilePath);
+                        extractedText = doc.ToString(SaveFormat.Text);
+                        break;
+
                     case ".txt":
                         extractedText = await File.ReadAllTextAsync(tempFilePath);
                         break;
@@ -173,6 +188,7 @@ namespace PCNWSolrUploadFiles.Controllers
                         _logger.LogError("Unsupported file type: {fileName}", fileName);
                         return false;
                 }
+
 
                 var solrDocument = new
                 {
