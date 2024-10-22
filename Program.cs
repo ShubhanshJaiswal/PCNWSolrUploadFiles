@@ -36,7 +36,7 @@ namespace PCNWSolrUploadFiles
                 .MinimumLevel.Information()
                 .MinimumLevel.Override("Microsoft.EntityFrameworkCore", LogEventLevel.Warning) 
                 .WriteTo.Console()
-                .WriteTo.File("logs/log.txt", rollingInterval: RollingInterval.Day)
+                .WriteTo.File("G:\\MyLogs\\SolrPDFUploaderLogs\\log.txt", rollingInterval: RollingInterval.Day)
                 .Filter.ByExcluding(Matching.FromSource("Microsoft.EntityFrameworkCore"))
             ) 
                 .ConfigureAppConfiguration((context, config) =>
