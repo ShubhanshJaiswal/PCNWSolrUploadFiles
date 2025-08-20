@@ -21,23 +21,30 @@ public class UploadWorkerService : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("Worker running at: {time}", DateTimeOffset.Now);
+        _logger.LogInformation("Worker started at: {time}", DateTimeOffset.Now);
+
+        bool firstRun = true;
 
         while (!stoppingToken.IsCancellationRequested)
         {
-            var now = DateTime.Now;
-            var nextRunTime = DateTime.Today.AddHours(2);
+            TimeSpan delay;
 
-            if (now > nextRunTime)
-                nextRunTime = nextRunTime.AddDays(1);
+            if (firstRun)
+            {
+                // Run immediately on first execution
+                delay = TimeSpan.Zero;
+                firstRun = false;
+            }
+            else
+            {
+                var now = DateTime.Now;
+                var nextMidnight = DateTime.Today.AddDays(1); 
+                delay = nextMidnight - now;
+            }
 
-            // Run immediately 
-            int a = 0; // Change this to 1 for immediate execution, and 0 for production timing
-            var delay = (a > 0) ? TimeSpan.Zero : nextRunTime - now;
+            _logger.LogInformation("Next run scheduled in: {delay}", delay);
 
-            _logger.LogInformation("Next run scheduled at: {time}", nextRunTime);
-
-            // Wait for the next run time or proceed immediately if `delay` is zero
+            // Wait for the calculated delay
             await Task.Delay(delay, stoppingToken);
 
             try
@@ -58,4 +65,5 @@ public class UploadWorkerService : BackgroundService
             }
         }
     }
+
 }
