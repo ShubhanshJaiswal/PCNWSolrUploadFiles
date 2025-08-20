@@ -1,12 +1,11 @@
-﻿using DocumentFormat.OpenXml.Packaging;
+﻿using Aspose.Words;
+using DocumentFormat.OpenXml.Packaging;
 using Microsoft.EntityFrameworkCore;
 using PCNWSolrUploadFiles.Data;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using UglyToad.PdfPig;
-using UglyToad.PdfPig.Util;
-using Aspose.Words;
-
 
 namespace PCNWSolrUploadFiles.Controllers
 {
@@ -18,7 +17,16 @@ namespace PCNWSolrUploadFiles.Controllers
         private readonly string _solrURL;
         private readonly ILogger<UploadController> _logger;
 
-        public UploadController(PcnwprojectDbContext dbContext, IConfiguration configuration, ILogger<UploadController> logger)
+        // Reuse HttpClient
+        private static readonly HttpClient _http = new HttpClient
+        {
+            Timeout = TimeSpan.FromSeconds(60)
+        };
+
+        public UploadController(
+            PcnwprojectDbContext dbContext,
+            IConfiguration configuration,
+            ILogger<UploadController> logger)
         {
             _dbContext = dbContext;
             _configuration = configuration;
@@ -55,82 +63,126 @@ namespace PCNWSolrUploadFiles.Controllers
                         foreach (var projectFolder in projectNumberFolders)
                         {
                             var projectNumber = Path.GetFileName(projectFolder);
-
                             _logger.LogInformation("Processing project: {projectNumber}", projectNumber);
 
                             var projectId = await _dbContext.Projects
-                                .Where(p => p.ProjNumber == projectNumber && (bool)p.Publish! /*&& (p.IndexPdffiles == true || p.IndexPdffiles == null)*/)
+                                .Where(p => p.ProjNumber == projectNumber && (bool)p.Publish!)
                                 .Select(p => p.ProjId)
                                 .FirstOrDefaultAsync();
 
-                            if (projectId == 0 )
+                            if (projectId == 0)
                             {
-                                _logger.LogWarning("Project ID not found or not eligible for indexing: {projectNumber}", projectNumber);
+                                _logger.LogWarning("Project ID not found or not eligible: {projectNumber}", projectNumber);
                                 continue;
                             }
 
-                            var lastIndexedDate = await _dbContext.Projects
-                                .Where(p => p.ProjId == projectId)
-                                .Select(p => p.SolrIndexPdfdt)
-                                .FirstOrDefaultAsync();
+                            // Per-project scan marker
+                            var scanId = Guid.NewGuid().ToString("N");
 
-                            lastIndexedDate = lastIndexedDate ?? DateTime.MinValue;
+                            var allowedExtensions = new[] { ".pdf", ".docx", ".doc", ".txt" };
+                            var fileEnum = Directory.EnumerateFiles(projectFolder, "*.*", SearchOption.AllDirectories)
+                                                    .Where(f => allowedExtensions.Contains(Path.GetExtension(f).ToLower()));
 
-                            var allowedExtensions = new[] { ".pdf", ".docx",".doc", ".txt" };
-                            var allFolders = Directory.GetDirectories(projectFolder, "*", SearchOption.AllDirectories);
-                            var success = false;
-                            foreach (var folder in allFolders)
+                            var docsBatch = new List<object>();
+                            const int batchSize = 100;
+                            var anySent = false;
+
+                            foreach (var file in fileEnum)
                             {
-                                //var files = Directory.GetFiles(folder);
-                                //foreach (var item in files)
-                                //{
-                                //    var ext = Path.GetExtension(item).ToLower();
-                                //}
-                                foreach (var filePath in Directory.GetFiles(folder).Where(file =>
-                                            allowedExtensions.Contains(Path.GetExtension(file).ToLower()) &&
-                                            File.GetLastWriteTime(file) > lastIndexedDate))
+                                var relativePath = GetRelativePath(projectFolder, file);
+                                var id = BuildSolrId(projectId, relativePath);
+                                var parentDir = Path.GetDirectoryName(file);
+                                var folderType = Path.GetFileName(parentDir ?? string.Empty);
+
+                                // Extract content
+                                var (ok, extractedText, checksum) = await ExtractFileContent(file);
+                                if (!ok)
                                 {
-                                    _logger.LogInformation("Processing file: {filePath}", filePath);
+                                    _logger.LogError("Skipping file due to extraction failure: {file}", file);
+                                    continue;
+                                }
 
-                                    var folderType = Path.GetFileName(folder); 
-                                    success = await ProcessFile(projectId, filePath, folderType); 
+                                var info = new FileInfo(file);
+                                var lastModifiedUtc = info.LastWriteTimeUtc;
 
-                                    if (!success)
+                                // Build Solr doc (use dynamic fields for schema friendliness)
+                                var solrDoc = new Dictionary<string, object?>
+                                {
+                                    ["id"] = id,
+                                    ["projectId"] = projectId,
+                                    ["filename_s"] = Path.GetFileName(file),
+                                    ["relativePath_s"] = relativePath.Replace('\\', '/'),
+                                    ["sourceType_s"] = folderType,
+                                    ["content_txt"] = extractedText ?? string.Empty,
+                                    ["checksum_s"] = checksum,
+                                    ["lastModified_dt"] = lastModifiedUtc.ToString("o"),
+                                    ["fileSize_l"] = info.Length,
+                                    ["scanId_s"] = scanId
+                                };
+
+                                // Add to batch as { "doc": { ... } } so we can POST { "add": [ {doc}, {doc} ] }
+                                docsBatch.Add(new { doc = solrDoc });
+
+                                if (docsBatch.Count >= batchSize)
+                                {
+                                    var addPayload = JsonSerializer.Serialize(new { add = docsBatch });
+                                    var addOk = await PostSolrJsonAsync($"{_solrURL}/update", addPayload, _logger);
+                                    if (!addOk)
                                     {
-                                        _logger.LogError("Failed to process file: {filePath}", filePath);
-                                        continue;
+                                        _logger.LogError("Failed posting batch to Solr (project {projectId}).", projectId);
                                     }
+                                    else
+                                    {
+                                        anySent = true;
+                                    }
+                                    docsBatch.Clear();
                                 }
                             }
 
+                            // Flush remainder
+                            if (docsBatch.Any())
+                            {
+                                var addPayload = JsonSerializer.Serialize(new { add = docsBatch });
+                                var addOk = await PostSolrJsonAsync($"{_solrURL}/update", addPayload, _logger);
+                                if (!addOk)
+                                {
+                                    _logger.LogError("Failed posting final batch to Solr (project {projectId}).", projectId);
+                                }
+                                else
+                                {
+                                    anySent = true;
+                                }
+                                docsBatch.Clear();
+                            }
 
-                            //foreach (var pdfFilePath in pdfFiles.ToArray())
-                            //{
-                            //    _logger.LogInformation("Processing PDF file: {pdfFilePath}", pdfFilePath);
-                            //    var success = await ProcessPdfFile(projectId, pdfFilePath);
-                            //    if (!success)
-                            //    {
-                            //        _logger.LogError("Failed to process PDF file: {pdfFilePath}", pdfFilePath);
-                            //        continue;
-                            //    }
-                            //}
+                            // Delete anything not touched in this scan (stale docs)
+                            // projectId:<id> AND NOT scanId_s:<scanId>
+                            var deleteQuery = $"projectId:{projectId} AND NOT scanId_s:{scanId}";
+                            var deletePayload = JsonSerializer.Serialize(new { delete = new { query = deleteQuery } });
+                            var delOk = await PostSolrJsonAsync($"{_solrURL}/update", deletePayload, _logger);
+                            if (!delOk)
+                            {
+                                _logger.LogError("Failed deleteByQuery cleanup for project {projectId}.", projectId);
+                            }
 
+                            // Commit once per project
+                            var commitOk = await PostSolrJsonAsync($"{_solrURL}/update?commit=true", "{}", _logger);
+                            if (!commitOk)
+                            {
+                                _logger.LogError("Failed commit for project {projectId}.", projectId);
+                            }
+
+                            // Update DB timestamps/flags (if anything happened we still mark timestamps)
                             var project = await _dbContext.Projects.FirstOrDefaultAsync(m => m.ProjId == projectId);
-                            if (project != null && success)
+                            if (project != null)
                             {
                                 project.IndexPdffiles = false;
                                 project.SolrIndexDt = DateTime.Now;
-                                project.SolrIndexPdfdt = DateTime.Now; 
+                                project.SolrIndexPdfdt = DateTime.Now;
                                 await _dbContext.SaveChangesAsync();
-
-                                _logger.LogInformation("Project {projectNumber} successfully marked as indexed", projectNumber);
-                            }
-                            else if(!success)
-                            {
-                                _logger.LogInformation("Project {projectNumber} already marked as indexed", projectNumber);
+                                _logger.LogInformation("Project {projectNumber} indexed & committed (sent: {sent}).", projectNumber, anySent);
                             }
                         }
-
                     }
                 }
 
@@ -143,7 +195,63 @@ namespace PCNWSolrUploadFiles.Controllers
             }
         }
 
-        private async Task<bool> ProcessFile(int projectId, string filePath, string sourceType)
+        // -----------------------------
+        // Helpers
+        // -----------------------------
+
+        private static string GetRelativePath(string baseDir, string fullPath)
+        {
+            var baseUri = new Uri(AppendDirectorySeparatorChar(baseDir));
+            var fullUri = new Uri(fullPath);
+            var relative = Uri.UnescapeDataString(baseUri.MakeRelativeUri(fullUri).ToString());
+            return relative.Replace('/', Path.DirectorySeparatorChar);
+        }
+
+        private static string AppendDirectorySeparatorChar(string path)
+        {
+            if (!path.EndsWith(Path.DirectorySeparatorChar))
+                return path + Path.DirectorySeparatorChar;
+            return path;
+        }
+
+        private static string BuildSolrId(int projectId, string relativePath)
+        {
+            var norm = relativePath.Replace('\\', '/');
+            return $"{projectId}|{norm}";
+        }
+
+        private static string ComputeSHA256(string filePath)
+        {
+            using var sha = SHA256.Create();
+            using var fs = File.OpenRead(filePath);
+            var hash = sha.ComputeHash(fs);
+            return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
+        }
+
+        private async Task<bool> PostSolrJsonAsync(string url, string json, ILogger logger, int maxRetries = 3)
+        {
+            for (int attempt = 1; attempt <= maxRetries; attempt++)
+            {
+                try
+                {
+                    using var content = new StringContent(json, Encoding.UTF8, "application/json");
+                    var resp = await _http.PostAsync(url, content);
+                    if (resp.IsSuccessStatusCode) return true;
+
+                    logger.LogError("Solr call failed (attempt {attempt}/{max}): {status} {reason}",
+                        attempt, maxRetries, resp.StatusCode, resp.ReasonPhrase);
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError(ex, "Solr call exception (attempt {attempt}/{max})", attempt, maxRetries);
+                }
+
+                await Task.Delay(TimeSpan.FromMilliseconds(300 * attempt * attempt));
+            }
+            return false;
+        }
+
+        private async Task<(bool success, string content, string checksum)> ExtractFileContent(string filePath)
         {
             try
             {
@@ -151,12 +259,9 @@ namespace PCNWSolrUploadFiles.Controllers
                 var guid = Guid.NewGuid().ToString();
                 var tempFilePath = Path.Combine(Path.GetTempPath(), $"{guid}_{fileName}");
 
-                _logger.LogInformation("Processing file: {fileName}, projectId: {projectId}, sourceType: {sourceType}", fileName, projectId, sourceType);
-
                 File.Copy(filePath, tempFilePath, true);
 
                 string extractedText = string.Empty;
-
                 var extension = Path.GetExtension(filePath).ToLower();
 
                 switch (extension)
@@ -176,7 +281,7 @@ namespace PCNWSolrUploadFiles.Controllers
                         break;
 
                     case ".doc":
-                        Document doc = new Document(tempFilePath);
+                        var doc = new Document(tempFilePath);
                         extractedText = doc.ToString(SaveFormat.Text);
                         break;
 
@@ -186,73 +291,32 @@ namespace PCNWSolrUploadFiles.Controllers
 
                     default:
                         _logger.LogError("Unsupported file type: {fileName}", fileName);
-                        return false;
+                        return (false, string.Empty, string.Empty);
                 }
 
-
-                var solrDocument = new
-                {
-                    add = new
-                    {
-                        doc = new
-                        {
-                            id = $"{projectId}_{guid}",
-                            projectId,
-                            filename = fileName,
-                            content = extractedText,
-                            sourceType
-                        }
-                    }
-                };
-
-                var jsonDocument = JsonSerializer.Serialize(solrDocument);
-
-                using (var httpClient = new HttpClient())
-                {
-                    var content = new StringContent(jsonDocument, Encoding.UTF8, "application/json");
-                    var response = await httpClient.PostAsync(_solrURL + "/update?commit=true", content);
-
-                    if (!response.IsSuccessStatusCode)
-                    {
-                        _logger.LogError("Solr indexing failed for file: {filePath}, Status Code: {statusCode}", filePath, response.StatusCode);
-                        return false;
-                    }
-                }
-
-                _logger.LogInformation("Successfully processed file: {fileName}, projectId: {projectId}, sourceType: {sourceType}", fileName, projectId, sourceType);
+                var checksum = ComputeSHA256(tempFilePath);
 
                 if (File.Exists(tempFilePath))
-                {
                     File.Delete(tempFilePath);
-                }
 
-                return true;
+                return (true, extractedText, checksum);
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error processing file: {filePath}", filePath);
-                return false;
+                _logger.LogError(ex, "Error extracting file content: {filePath}", filePath);
+                return (false, string.Empty, string.Empty);
             }
         }
 
         private static string ExtractTextFromDocx(WordprocessingDocument wordDocument)
         {
-            if (wordDocument.MainDocumentPart == null)
-            {
-                return string.Empty; 
-            }
+            if (wordDocument.MainDocumentPart == null) return string.Empty;
 
             var document = wordDocument.MainDocumentPart.Document;
+            if (document?.Body == null) return string.Empty;
 
-            if (document == null || document.Body == null)
-            {
-                return string.Empty;
-            }
-
-            return document.Body.InnerText;
+            return document.Body.InnerText ?? string.Empty;
         }
-
-
 
         private static string ExtractTextFromPdf(PdfDocument pdf)
         {
@@ -264,5 +328,4 @@ namespace PCNWSolrUploadFiles.Controllers
             return sb.ToString();
         }
     }
-
 }
