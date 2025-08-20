@@ -88,7 +88,7 @@ namespace PCNWSolrUploadFiles.Controllers
                                 //}
                                 foreach (var filePath in Directory.GetFiles(folder).Where(file =>
                                             allowedExtensions.Contains(Path.GetExtension(file).ToLower()) &&
-                                            File.GetCreationTime(file) > lastIndexedDate))
+                                            File.GetLastWriteTime(file) > lastIndexedDate))
                                 {
                                     _logger.LogInformation("Processing file: {filePath}", filePath);
 
