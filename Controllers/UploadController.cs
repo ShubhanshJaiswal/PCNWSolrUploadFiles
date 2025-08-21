@@ -97,17 +97,17 @@ namespace PCNWSolrUploadFiles.Controllers
                 // ---- Folder selection ----
                 // Keep your current constraints or generalize as needed.
                 // Currently emulates your sample: 2025 / 07 / 25070103
-                var yearFolders = Directory.GetDirectories(baseDirectory).Where(m => Path.GetFileName(m) == "2025");
+                var yearFolders = Directory.GetDirectories(baseDirectory)/*.Where(m => Path.GetFileName(m) == "2025")*/;
 
                 foreach (var yearFolder in yearFolders)
                 {
                     _logger.LogInformation("Processing year folder: {yearFolder}", yearFolder);
-                    var monthFolders = Directory.GetDirectories(yearFolder).Where(m => Path.GetFileName(m) == "07");
+                    var monthFolders = Directory.GetDirectories(yearFolder)/*.Where(m => Path.GetFileName(m) == "07")*/;
 
                     foreach (var monthFolder in monthFolders)
                     {
                         _logger.LogInformation("Processing month folder: {monthFolder}", monthFolder);
-                        var projectNumberFolders = Directory.GetDirectories(monthFolder).Where(m => Path.GetFileName(m) == "25070103");
+                        var projectNumberFolders = Directory.GetDirectories(monthFolder)/*.Where(m => Path.GetFileName(m) == "25070103")*/;
 
                         foreach (var projectFolder in projectNumberFolders)
                         {
