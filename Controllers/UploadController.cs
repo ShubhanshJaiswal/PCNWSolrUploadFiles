@@ -8,6 +8,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using UglyToad.PdfPig;
+using UglyToad.PdfPig.Core;
 
 namespace PCNWSolrUploadFiles.Controllers
 {
@@ -422,49 +423,130 @@ namespace PCNWSolrUploadFiles.Controllers
 
         private IEnumerable<(int page, string text)> ExtractPdfPages(string path)
         {
-            UglyToad.PdfPig.PdfDocument pdf = null;
+            PdfDocument pdf;
+            string tempSalvaged;
+
+            // Open pdf (with salvage) in a helper that uses try/catch (no yields there)
+            if (!TryOpenPdfWithSalvage(path, out pdf, out tempSalvaged))
+                yield break;
+
+            try // <-- try/finally is allowed with yield; just don’t put yield in finally
+            {
+                using (pdf) // dispose when enumeration completes
+                {
+                    int total = pdf.NumberOfPages;
+
+                    for (int p = 1; p <= total; p++)
+                    {
+                        string text = null; // set inside try, yield after
+
+                        try
+                        {
+                            var page = pdf.GetPage(p);
+                            text = page?.Text;
+                        }
+                        catch (PdfDocumentFormatException ex)
+                        {
+                            _logger.LogWarning(ex, "Skipping bad PDF page {page} in {path}", p, path);
+                            // leave 'text' null
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(ex, "Skipping page {page} in {path}", p, path);
+                        }
+
+                        if (!string.IsNullOrWhiteSpace(text))
+                            yield return (p, text);  // <-- yield OUTSIDE try/catch
+                    }
+                }
+            }
+            finally
+            {
+                if (!string.IsNullOrEmpty(tempSalvaged))
+                {
+                    try { System.IO.File.Delete(tempSalvaged); } catch { /* ignore */ }
+                }
+            }
+        }
+
+        // Helper does all try/catch; NO yield here, so it compiles fine.
+        private bool TryOpenPdfWithSalvage(string path, out PdfDocument pdf, out string tempSalvaged)
+        {
+            pdf = null;
+            tempSalvaged = null;
+
             try
             {
-                // If you have a newer PdfPig with ParsingOptions you can pass them here.
-                // e.g., PdfDocument.Open(path, new ParsingOptions { /* lenient flags if available */ });
-                pdf = UglyToad.PdfPig.PdfDocument.Open(path);
+                pdf = PdfDocument.Open(path);
+                return true;
+            }
+            catch (PdfDocumentFormatException ex)
+            {
+                _logger.LogWarning(ex, "PDF open failed (header or structure). Trying salvage: {path}", path);
+
+                if (!TrySalvagePdfByHeader(path, out tempSalvaged))
+                    return false;
+
+                try
+                {
+                    pdf = PdfDocument.Open(tempSalvaged);
+                    return true;
+                }
+                catch (Exception ex2)
+                {
+                    _logger.LogError(ex2, "Salvaged PDF still failed to open: {temp}", tempSalvaged);
+                    return false;
+                }
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "PDF open failed: {path}", path);
-                yield break;
+                return false;
             }
+        }
 
-            var totalPages = pdf.NumberOfPages;
-
-            for (int p = 1; p <= totalPages; p++)
+        // Scan first 1MB for "%PDF-" and write a temp file starting at that offset
+        private bool TrySalvagePdfByHeader(string path, out string tempPath)
+        {
+            tempPath = null;
+            try
             {
-                string text = string.Empty;
+                var bytes = System.IO.File.ReadAllBytes(path);
+                if (bytes == null || bytes.Length < 8) return false;
 
-                try
-                {
-                    // Access page inside try/catch so a single bad page doesn't break the iterator
-                    var page = pdf.GetPage(p);
-                    text = page?.Text ?? string.Empty;
-                }
-                catch (UglyToad.PdfPig.Core.PdfDocumentFormatException ex)
-                {
-                    // Example: "No XObject with name /Xop34 found on page 48."
-                    _logger.LogWarning(ex, "Skipping PDF page {page} in {path} due to parse error.", p, path);
-                    continue; // move on to next page
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Skipping PDF page {page} in {path} due to unexpected error.", p, path);
-                    continue;
-                }
+                var sig = Encoding.ASCII.GetBytes("%PDF-");
+                var idx = IndexOf(bytes, sig, 0, Math.Min(bytes.Length, 1024 * 1024));
+                if (idx < 0) return false;
 
-                if (!string.IsNullOrWhiteSpace(text))
-                    yield return (p, text);
-                // else: empty page, skip
+                tempPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(),
+                    "pcnw_pdfsalvage_" + Guid.NewGuid().ToString("N") + ".pdf");
+
+                using (var fs = System.IO.File.Create(tempPath))
+                    fs.Write(bytes, idx, bytes.Length - idx);
+
+                _logger.LogInformation("Salvaged PDF by trimming {trim} bytes: {temp}", idx, tempPath);
+                return true;
             }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "TrySalvagePdfByHeader failed for {path}", path);
+                tempPath = null;
+                return false;
+            }
+        }
 
-            pdf.Dispose();
+        private static int IndexOf(byte[] haystack, byte[] needle, int start, int count)
+        {
+            if (needle == null || needle.Length == 0) return start;
+            int end = Math.Min(haystack.Length, start + count);
+            for (int i = start; i <= end - needle.Length; i++)
+            {
+                int j = 0;
+                for (; j < needle.Length; j++)
+                    if (haystack[i + j] != needle[j]) break;
+                if (j == needle.Length) return i;
+            }
+            return -1;
         }
 
         // Uses Aspose.Words page splitter so DOC/DOCX are also page-addressable
