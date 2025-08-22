@@ -407,7 +407,7 @@ namespace PCNWSolrUploadFiles.Controllers
         // Extraction helpers (per-page)
         // ============================
 
-        private static IEnumerable<(int page, string text)> ExtractPages(string filePath)
+        private IEnumerable<(int page, string text)> ExtractPages(string filePath)
         {
             var ext = Path.GetExtension(filePath).ToLowerInvariant();
             return ext switch
@@ -420,17 +420,51 @@ namespace PCNWSolrUploadFiles.Controllers
             };
         }
 
-        private static IEnumerable<(int page, string text)> ExtractPdfPages(string path)
+        private IEnumerable<(int page, string text)> ExtractPdfPages(string path)
         {
-            using var pdf = PdfDocument.Open(path);
-            int p = 1;
-            foreach (var page in pdf.GetPages())
+            UglyToad.PdfPig.PdfDocument pdf = null;
+            try
             {
-                var t = page.Text ?? string.Empty;
-                if (!string.IsNullOrWhiteSpace(t))
-                    yield return (p, t);
-                p++;
+                // If you have a newer PdfPig with ParsingOptions you can pass them here.
+                // e.g., PdfDocument.Open(path, new ParsingOptions { /* lenient flags if available */ });
+                pdf = UglyToad.PdfPig.PdfDocument.Open(path);
             }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "PDF open failed: {path}", path);
+                yield break;
+            }
+
+            var totalPages = pdf.NumberOfPages;
+
+            for (int p = 1; p <= totalPages; p++)
+            {
+                string text = string.Empty;
+
+                try
+                {
+                    // Access page inside try/catch so a single bad page doesn't break the iterator
+                    var page = pdf.GetPage(p);
+                    text = page?.Text ?? string.Empty;
+                }
+                catch (UglyToad.PdfPig.Core.PdfDocumentFormatException ex)
+                {
+                    // Example: "No XObject with name /Xop34 found on page 48."
+                    _logger.LogWarning(ex, "Skipping PDF page {page} in {path} due to parse error.", p, path);
+                    continue; // move on to next page
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Skipping PDF page {page} in {path} due to unexpected error.", p, path);
+                    continue;
+                }
+
+                if (!string.IsNullOrWhiteSpace(text))
+                    yield return (p, text);
+                // else: empty page, skip
+            }
+
+            pdf.Dispose();
         }
 
         // Uses Aspose.Words page splitter so DOC/DOCX are also page-addressable
