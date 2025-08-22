@@ -6,6 +6,7 @@ using PCNWSolrUploadFiles.Data;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using UglyToad.PdfPig;
 
 namespace PCNWSolrUploadFiles.Controllers
@@ -70,6 +71,7 @@ namespace PCNWSolrUploadFiles.Controllers
         /// </summary>
         public async Task UploadAllFiles()
         {
+            //await ClearSolrAllAsync();
             var overallStart = DateTime.UtcNow;
 
             try
@@ -81,13 +83,13 @@ namespace PCNWSolrUploadFiles.Controllers
                     throw new DirectoryNotFoundException($"Base directory not found: {baseDirectory}");
 
                 // ---- Folder selection (adjust filters as needed) ----
-                var yearFolders = Directory.GetDirectories(baseDirectory)/*.Where(m => Path.GetFileName(m) == "2025")*/; 
+                var yearFolders = Directory.GetDirectories(baseDirectory)/*.Where(m => Path.GetFileName(m) == "2025")*/;
                 foreach (var yearFolder in yearFolders)
                 {
                     var monthFolders = Directory.GetDirectories(yearFolder)/*.Where(m => Path.GetFileName(m) == "07")*/;
                     foreach (var monthFolder in monthFolders)
                     {
-                        var projectNumberFolders = Directory.GetDirectories(monthFolder)/*.Where(m => Path.GetFileName(m) == "25070103")*/; 
+                        var projectNumberFolders = Directory.GetDirectories(monthFolder)/*.Where(m => Path.GetFileName(m) == "25070103")*/;
                         foreach (var projectFolder in projectNumberFolders)
                         {
                             var swProject = System.Diagnostics.Stopwatch.StartNew();
@@ -161,21 +163,17 @@ namespace PCNWSolrUploadFiles.Controllers
                                     const int BATCH = 300;
                                     var buffer = new List<Dictionary<string, object?>>(BATCH);
 
-                                    foreach (var (page, text) in pages)
+                                    foreach (var (page, textRaw) in pages)
                                     {
+                                        var text = CleanAsposeEvaluationNoise(textRaw);
                                         if (string.IsNullOrWhiteSpace(text)) continue;
 
                                         var doc = new Dictionary<string, object?>
                                         {
-                                            // Unique per page
                                             ["id"] = $"{idBase}#{page}",
-
-                                            // Filters / joins
                                             ["projectId_i"] = projectId,
                                             ["fileId_s"] = fileId,
                                             ["doc_type_s"] = "page",
-
-                                            // File metadata
                                             ["filename_s"] = Path.GetFileName(file),
                                             ["relativePath_s"] = relativePath,
                                             ["page_i"] = page,
@@ -183,19 +181,11 @@ namespace PCNWSolrUploadFiles.Controllers
                                             ["fileSize_l"] = info.Length,
                                             ["lastModified_dt"] = lastModUtc.ToString("o"),
                                             ["scanId_s"] = scanId,
-
-                                            // Content (per-page text) — FVH needs stored + termVectors
-                                            ["content_txt"] = text
+                                            ["content_txt"] = text                      // sanitized text
                                         };
 
                                         buffer.Add(doc);
-
-                                        if (buffer.Count >= BATCH)
-                                        {
-                                            var ok = await AddDocsBatchAsync(buffer);
-                                            if (!ok) { failed++; break; }
-                                            buffer.Clear();
-                                        }
+                                        if (buffer.Count >= BATCH) { var ok = await AddDocsBatchAsync(buffer); if (!ok) { failed++; break; } buffer.Clear(); }
                                     }
 
                                     if (buffer.Count > 0)
@@ -247,7 +237,26 @@ namespace PCNWSolrUploadFiles.Controllers
                 throw;
             }
         }
+        private static readonly Regex[] AsposeEvalNoise = new[]
+        {
+            new Regex(@"^\s*Created with an evaluation copy of Aspose\.Words.*$", RegexOptions.IgnoreCase | RegexOptions.Multiline),
+            new Regex(@"^\s*Evaluation Only\.\s*Created with Aspose\.Words.*$", RegexOptions.IgnoreCase | RegexOptions.Multiline),
+            new Regex(@"https?://products\.aspose\.com/words/temporary-license/?", RegexOptions.IgnoreCase | RegexOptions.Multiline),
+            new Regex(@"Copyright\s+\d{4}(?:-\d{4})?\s+Aspose Pty Ltd\.?", RegexOptions.IgnoreCase | RegexOptions.Multiline)
+        };
 
+        private static string CleanAsposeEvaluationNoise(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return text ?? string.Empty;
+
+            foreach (var rx in AsposeEvalNoise)
+                text = rx.Replace(text, string.Empty);
+
+            // collapse extra blank lines/whitespace that may be left behind
+            text = Regex.Replace(text, @"[ \t]+\r?\n", "\n");    // trim line-end spaces
+            text = Regex.Replace(text, @"(\r?\n){3,}", "\n\n");  // collapse >2 blank lines to 1 blank line
+            return text.Trim();
+        }
         // ============================
         // Solr helpers (batch add, touch, delete, select)
         // ============================
@@ -427,19 +436,24 @@ namespace PCNWSolrUploadFiles.Controllers
         // Uses Aspose.Words page splitter so DOC/DOCX are also page-addressable
         private static IEnumerable<(int page, string text)> ExtractDocOrDocxPages(string path)
         {
-            var doc = new Document(path);
-            doc.UpdatePageLayout(); // ensure page map is ready
-            var collector = new LayoutCollector(doc);
+            var doc = new Aspose.Words.Document(path);
+            doc.UpdatePageLayout();
+            var collector = new Aspose.Words.Layout.LayoutCollector(doc);
+
+            // NOTE: Your current DocumentPageSplitter stub returns the whole doc for every page.
+            // If you want true per-page text, drop in Aspose's official PageSplitter sample.
             var splitter = new DocumentPageSplitter(collector);
 
             for (int i = 1; i <= doc.PageCount; i++)
             {
                 var pageDoc = splitter.GetDocumentOfPage(i);
-                var text = pageDoc.ToString(SaveFormat.Text);
-                if (!string.IsNullOrWhiteSpace(text))
-                    yield return (i, text);
+                var raw = pageDoc.ToString(Aspose.Words.SaveFormat.Text);
+                var cleaned = CleanAsposeEvaluationNoise(raw);
+                if (!string.IsNullOrWhiteSpace(cleaned))
+                    yield return (i, cleaned);
             }
         }
+
 
         private static IEnumerable<(int page, string text)> ExtractTxtAsSinglePage(string path)
         {
