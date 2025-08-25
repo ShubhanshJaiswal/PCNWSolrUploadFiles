@@ -47,7 +47,11 @@ namespace PCNWSolrUploadFiles.Controllers
 
         public async Task UploadAllFiles()
         {
-                var overallStart = DateTime.UtcNow;
+            //await ClearSolrAllAsync();
+            // Anywhere in your service:
+            //var ok = await SolrRootFieldFixer.EnsureRootNoDocValuesAsync(_solrURL, _logger);
+
+            var overallStart = DateTime.UtcNow;
 
             try
             {
@@ -62,13 +66,13 @@ namespace PCNWSolrUploadFiles.Controllers
                 if (!Directory.Exists(baseDir))
                     throw new DirectoryNotFoundException($"Base directory not found: {baseDir}");
 
-                var yearFolders = Directory.GetDirectories(baseDir).Where(m=>Path.GetFileName(m)=="2024");
+                var yearFolders = Directory.GetDirectories(baseDir)/*.Where(m=>Path.GetFileName(m)=="2024")*/;
                 foreach (var yearFolder in yearFolders)
                 {
-                    var monthFolders = Directory.GetDirectories(yearFolder).Where(m => Path.GetFileName(m) == "07");
+                    var monthFolders = Directory.GetDirectories(yearFolder);
                     foreach (var monthFolder in monthFolders)
                     {
-                        var projectFolders = Directory.GetDirectories(monthFolder).Where(m => Path.GetFileName(m) == "24070005");
+                        var projectFolders = Directory.GetDirectories(monthFolder);
                         foreach (var projectFolder in projectFolders)
                         {
                             var sw = System.Diagnostics.Stopwatch.StartNew();
