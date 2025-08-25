@@ -1,10 +1,17 @@
 ﻿using Aspose.Words;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
 using PCNWSolrUploadFiles.Data;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Net.Http;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Threading.Tasks;
 using UglyToad.PdfPig;
 using UglyToad.PdfPig.Core;
 
@@ -60,15 +67,15 @@ namespace PCNWSolrUploadFiles.Controllers
         }
 
         /// <summary>
-        /// Main indexer: scans folders and sends files to Solr.
-        /// - Only uploads when a project folder has supported files.
-        /// - Unchanged files (checksum) => atomic "touch" to set scanId_s (no re-extraction).
-        /// - New/changed => delete old docs of that fileId, re-add.
-        /// - Project-level cleanup deletes only docs that have a scanId_s and don't match this run's scanId (safe).
+        /// MAIN INDEXER
+        /// Scans base\{YYYY}\{MM}\{ProjectNumber}\... and indexes PDFs/Word/TXT into Solr.
+        /// - Unchanged files (by checksum) => atomic "touch" to set scanId_s (no re-extraction)
+        /// - New/changed => delete old docs of that fileId, re-add
+        /// - Project-level cleanup removes only docs having scanId_s != this run's scanId (safe)
         /// </summary>
         public async Task UploadAllFiles()
         {
-            await ClearSolrAllAsync();
+            // await ClearSolrAllAsync(); // only for a full reset
             var overallStart = DateTime.UtcNow;
 
             try
@@ -89,13 +96,14 @@ namespace PCNWSolrUploadFiles.Controllers
                 if (!Directory.Exists(baseDirectory))
                     throw new DirectoryNotFoundException($"Base directory not found: {baseDirectory}");
 
-                var yearFolders = Directory.GetDirectories(baseDirectory);
+                // Enumerate ALL years/months/projects under base path
+                var yearFolders = Directory.GetDirectories(baseDirectory); // e.g., 2023, 2024, 2025...
                 foreach (var yearFolder in yearFolders)
                 {
-                    var monthFolders = Directory.GetDirectories(yearFolder);
+                    var monthFolders = Directory.GetDirectories(yearFolder); // 01..12
                     foreach (var monthFolder in monthFolders)
                     {
-                        var projectNumberFolders = Directory.GetDirectories(monthFolder);
+                        var projectNumberFolders = Directory.GetDirectories(monthFolder); // e.g., 24070005
                         foreach (var projectFolder in projectNumberFolders)
                         {
                             var swProject = System.Diagnostics.Stopwatch.StartNew();
@@ -127,7 +135,7 @@ namespace PCNWSolrUploadFiles.Controllers
 
                             _logger.LogInformation("Project {projNumber} (Id {pid}): {count} files.", projectNumber, projectId, files.Count);
 
-                            var scanId = Guid.NewGuid().ToString("N");
+                            var scanId = Guid.NewGuid().ToString("N"); // safe for query usage
                             int index = 0, newOrUpdated = 0, touched = 0, failed = 0, addedDocs = 0;
 
                             foreach (var file in files)
@@ -166,7 +174,7 @@ namespace PCNWSolrUploadFiles.Controllers
                                         foreach (var (page, textRaw) in ExtractPdfPages(file))
                                         {
                                             var text = CleanAsposeEvaluationNoise(textRaw);
-                                            if (string.IsNullOrWhiteSpace(text)) continue;
+                                            if (string.IsNullOrWhiteSpace(text)) continue; // never push empty docs
 
                                             var doc = new Dictionary<string, object?>
                                             {
@@ -190,7 +198,7 @@ namespace PCNWSolrUploadFiles.Controllers
                                     }
                                     else if (ext == ".docx" || ext == ".doc")
                                     {
-                                        // Index as a single file-level doc (Word true per-page splitting requires full Aspose sample)
+                                        // Index as a single file-level doc (per-page split would need more Word layout logic)
                                         var text = ExtractDocAllText(file);
                                         text = CleanAsposeEvaluationNoise(text);
                                         if (!string.IsNullOrWhiteSpace(text))
@@ -290,9 +298,11 @@ namespace PCNWSolrUploadFiles.Controllers
         }
 
         // ---------------------------
-        // Solr SCHEMA bootstrap (idempotent)
+        // Solr SCHEMA bootstrap (idempotent & highlight-ready)
         // ---------------------------
+
         private record FieldDef(string name, string type, bool stored, bool indexed);
+
         private async Task<bool> EnsureSolrSchemaAsync()
         {
             try
@@ -305,56 +315,92 @@ namespace PCNWSolrUploadFiles.Controllers
                 var json = await resp.Content.ReadAsStringAsync();
                 using var doc = JsonDocument.Parse(json);
 
-                var existing = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var existing = new Dictionary<string, JsonElement>(StringComparer.OrdinalIgnoreCase);
                 if (doc.RootElement.TryGetProperty("fields", out var arr))
                 {
                     foreach (var f in arr.EnumerateArray())
                     {
                         if (f.TryGetProperty("name", out var n) && n.ValueKind == JsonValueKind.String)
-                            existing.Add(n.GetString()!);
+                            existing[n.GetString()!] = f;
                     }
                 }
 
                 var need = new List<FieldDef>
-        {
-            new("projectId_i","pint", stored:true, indexed:true),
-            new("fileId_s","string", stored:true, indexed:true),
-            new("doc_type_s","string", stored:true, indexed:true),
-            new("filename_s","string", stored:true, indexed:true),
-            new("relativePath_s","string", stored:true, indexed:true),
-            new("page_i","pint", stored:true, indexed:true),
-            new("checksum_s","string", stored:true, indexed:true),
-            new("fileSize_l","plong", stored:true, indexed:true),
-            new("lastModified_dt","pdate", stored:true, indexed:true),
-            new("scanId_s","string", stored:true, indexed:true),
-            new("content_txt","text_general", stored:false, indexed:true)
-        };
-
-                var toAdd = need.Where(n => !existing.Contains(n.name)).ToList();
-                if (toAdd.Count == 0) return true;
-
-                // 2) Build payload via dictionary (NOT an anonymous type)
-                var addPayload = new Dictionary<string, object?>
                 {
-                    ["add-field"] = toAdd
-                        .Select(f => new Dictionary<string, object?>
-                        {
-                            ["name"] = f.name,
-                            ["type"] = f.type,
-                            ["stored"] = f.stored,
-                            ["indexed"] = f.indexed,
-                            ["multiValued"] = false
-                        })
-                        .ToArray()
+                    new("projectId_i","pint", stored:true, indexed:true),
+                    new("fileId_s","string", stored:true, indexed:true),
+                    new("doc_type_s","string", stored:true, indexed:true),
+                    new("filename_s","string", stored:true, indexed:true),
+                    new("relativePath_s","string", stored:true, indexed:true),
+                    new("page_i","pint", stored:true, indexed:true),
+                    new("checksum_s","string", stored:true, indexed:true),
+                    new("fileSize_l","plong", stored:true, indexed:true),
+                    new("lastModified_dt","pdate", stored:true, indexed:true),
+                    new("scanId_s","string", stored:true, indexed:true),
+                    // Highlight-friendly: stored + term vectors for FVH
+                    new("content_txt","text_general", stored:true, indexed:true)
                 };
 
-                // 3) POST to /schema
-                var content = new StringContent(JsonSerializer.Serialize(addPayload), Encoding.UTF8, "application/json");
-                var addResp = await _http.PostAsync($"{_solrURL}/schema", content);
-                if (!addResp.IsSuccessStatusCode)
+                // 2) Add missing fields
+                var toAdd = need.Where(n => !existing.ContainsKey(n.name)).ToList();
+                if (toAdd.Count > 0)
                 {
-                    var body = await SafeReadAsync(addResp);
-                    _logger.LogWarning("Schema add-field returned {code}: {body}", (int)addResp.StatusCode, body);
+                    var addPayload = new Dictionary<string, object?>
+                    {
+                        ["add-field"] = toAdd
+                            .Select(f => new Dictionary<string, object?>
+                            {
+                                ["name"] = f.name,
+                                ["type"] = f.type,
+                                ["stored"] = f.stored,
+                                ["indexed"] = f.indexed,
+                                ["multiValued"] = false
+                            })
+                            .ToArray()
+                    };
+
+                    var addResp = await _http.PostAsync($"{_solrURL}/schema",
+                        new StringContent(JsonSerializer.Serialize(addPayload), Encoding.UTF8, "application/json"));
+                    if (!addResp.IsSuccessStatusCode)
+                    {
+                        var body = await SafeReadAsync(addResp);
+                        _logger.LogWarning("Schema add-field returned {code}: {body}", (int)addResp.StatusCode, body);
+                    }
+                }
+
+                // 3) Ensure content_txt has term vectors + stored true for FVH
+                if (existing.TryGetValue("content_txt", out var contentTxt))
+                {
+                    bool storedOk = contentTxt.TryGetProperty("stored", out var s) && s.ValueKind == JsonValueKind.True;
+                    bool tvOk = contentTxt.TryGetProperty("termVectors", out var tv) && tv.ValueKind == JsonValueKind.True;
+                    bool posOk = contentTxt.TryGetProperty("termPositions", out var tp) && tp.ValueKind == JsonValueKind.True;
+                    bool offOk = contentTxt.TryGetProperty("termOffsets", out var to) && to.ValueKind == JsonValueKind.True;
+
+                    if (!storedOk || !tvOk || !posOk || !offOk)
+                    {
+                        var replacePayload = new Dictionary<string, object?>
+                        {
+                            ["replace-field"] = new Dictionary<string, object?>
+                            {
+                                ["name"] = "content_txt",
+                                ["type"] = "text_general",
+                                ["stored"] = true,
+                                ["indexed"] = true,
+                                ["multiValued"] = false,
+                                ["termVectors"] = true,
+                                ["termPositions"] = true,
+                                ["termOffsets"] = true
+                            }
+                        };
+
+                        var repResp = await _http.PostAsync($"{_solrURL}/schema",
+                            new StringContent(JsonSerializer.Serialize(replacePayload), Encoding.UTF8, "application/json"));
+                        if (!repResp.IsSuccessStatusCode)
+                        {
+                            var body = await SafeReadAsync(repResp);
+                            _logger.LogWarning("Schema replace-field(content_txt) returned {code}: {body}", (int)repResp.StatusCode, body);
+                        }
+                    }
                 }
 
                 return true;
@@ -366,15 +412,18 @@ namespace PCNWSolrUploadFiles.Controllers
             }
         }
 
-
         // ---------------------------
         // Solr helpers (add, touch, delete, select)
         // ---------------------------
 
-        // Small buffered adder to avoid huge payloads; this variant adds one at a time (simple & safe).
+        // Adds one doc per request (simple & safe). NEVER sends empties.
         private async Task<bool> AddDocsBatchAsync_One(Dictionary<string, object?> doc, int maxRetries = 3)
         {
-            var payload = JsonSerializer.Serialize(new Dictionary<string, object?> { ["add"] = new[] { new Dictionary<string, object?> { ["doc"] = doc } } });
+            if (!doc.TryGetValue("content_txt", out var textObj) || string.IsNullOrWhiteSpace(textObj as string))
+                return true; // skip empty
+
+            var payload = JsonSerializer.Serialize(new[] { new Dictionary<string, object?> { ["add"] = new Dictionary<string, object?> { ["doc"] = doc } } });
+            // Use the classic add syntax: [{ "add": { "doc": { ... }}}]
             return await PostSolrJsonAsync($"{_solrURL}/update", payload, _logger, maxRetries);
         }
 
@@ -402,6 +451,9 @@ namespace PCNWSolrUploadFiles.Controllers
             }
         }
 
+        /// <summary>
+        /// PROPER atomic update: top-level array of partial docs, no "add" wrapper.
+        /// </summary>
         private async Task<bool> TouchAllDocsScanIdAsync(int projectId, string fileId, string scanId)
         {
             var ids = await SelectIdsForFileAsync(projectId, fileId);
@@ -410,18 +462,15 @@ namespace PCNWSolrUploadFiles.Controllers
             const int BATCH = 500;
             for (int i = 0; i < ids.Count; i += BATCH)
             {
-                var slice = ids.Skip(i).Take(BATCH)
+                var batch = ids.Skip(i).Take(BATCH)
                     .Select(id => new Dictionary<string, object?>
                     {
-                        ["doc"] = new Dictionary<string, object?>
-                        {
-                            ["id"] = id,
-                            ["scanId_s"] = new Dictionary<string, object?> { ["set"] = scanId }
-                        }
+                        ["id"] = id,
+                        ["scanId_s"] = new Dictionary<string, object?> { ["set"] = scanId }
                     })
-                    .ToList();
+                    .ToArray();
 
-                var payload = JsonSerializer.Serialize(new Dictionary<string, object?> { ["add"] = slice });
+                var payload = JsonSerializer.Serialize(batch);
                 var ok = await PostSolrJsonAsync($"{_solrURL}/update", payload, _logger);
                 if (!ok) return false;
             }
@@ -541,7 +590,7 @@ namespace PCNWSolrUploadFiles.Controllers
                         }
 
                         if (!string.IsNullOrWhiteSpace(text))
-                            yield return (p, text);  // yield OUTSIDE the try/catch
+                            yield return (p, text);  // yield outside the inner try/catch
                     }
                 }
             }
@@ -644,6 +693,27 @@ namespace PCNWSolrUploadFiles.Controllers
         // ---------------------------
         // Cleanup & utilities
         // ---------------------------
+
+        // OPTIONAL: purge junk docs that have no required fields (safe one-time cleanup)
+        public async Task<bool> RemoveDocsMissingRequiredFieldsAsync()
+        {
+            var query = "-projectId_i:[* TO *] OR -doc_type_s:[* TO *]";
+            var payload = JsonSerializer.Serialize(new { delete = new { query } });
+            var ok = await PostSolrJsonAsync($"{_solrURL}/update", payload, _logger);
+            if (!ok) return false;
+            return await PostSolrJsonAsync($"{_solrURL}/update?commit=true", "{}", _logger);
+        }
+
+        // OPTIONAL: purge docs where scanId_s was accidentally stored as a literal "{set=...}"
+        public async Task<bool> RemoveDocsWithLiteralSetInScanIdAsync()
+        {
+            // This pattern relies on escaping '{'. If your qparser dislikes it, simply rerun the indexer to overwrite values correctly.
+            var query = @"scanId_s:\{set\=*";
+            var payload = JsonSerializer.Serialize(new { delete = new { query } });
+            var ok = await PostSolrJsonAsync($"{_solrURL}/update", payload, _logger);
+            if (!ok) return false;
+            return await PostSolrJsonAsync($"{_solrURL}/update?commit=true", "{}", _logger);
+        }
 
         private static readonly Regex[] AsposeEvalNoise =
         {
