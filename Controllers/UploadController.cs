@@ -440,27 +440,77 @@ namespace PCNWSolrUploadFiles.Controllers
         /// Atomic touch using {"add":[ { "id":..., "scanId_s":{"set": "..."} }, ... ]}
         /// (Solr accepts atomic ops inside add docs; this avoids the 400 seen with raw arrays on some versions)
         /// </summary>
+        private async Task<List<(string Id, string? Root)>> SelectIdRootPairsForFileAsync(int projectId, string fileId)
+        {
+            var results = new List<(string Id, string? Root)>();
+            string cursor = "*";
+            const int ROWS = 1000;
+
+            while (true)
+            {
+                var url = $"{_solrURL}/select" +
+                          $"?q=projectId_i:{projectId}%20AND%20fileId_s:{fileId}" +
+                          $"&fl=id,_root_&rows={ROWS}&sort=id%20asc" +
+                          $"&cursorMark={Uri.EscapeDataString(cursor)}&wt=json";
+
+                var resp = await _http.GetAsync(url);
+                if (!resp.IsSuccessStatusCode) break;
+
+                var json = await resp.Content.ReadAsStringAsync();
+                using var doc = JsonDocument.Parse(json);
+
+                if (!doc.RootElement.TryGetProperty("response", out var response)) break;
+                if (!response.TryGetProperty("docs", out var docs)) break;
+
+                foreach (var d in docs.EnumerateArray())
+                {
+                    string? id = d.TryGetProperty("id", out var idEl) && idEl.ValueKind == JsonValueKind.String
+                        ? idEl.GetString()
+                        : null;
+                    if (string.IsNullOrEmpty(id)) continue;
+
+                    string? root = d.TryGetProperty("_root_", out var rootEl) && rootEl.ValueKind == JsonValueKind.String
+                        ? rootEl.GetString()
+                        : null;
+
+                    results.Add((id!, root));
+                }
+
+                if (!doc.RootElement.TryGetProperty("nextCursorMark", out var next)) break;
+                var nextCursor = next.GetString() ?? cursor;
+                if (nextCursor == cursor) break; // done
+                cursor = nextCursor;
+            }
+
+            return results;
+        }
+
+        /// Atomic “touch” that works on BOTH flat and nested docs.
+        /// Uses {"add":[ { "id":..., "_root_":..., "scanId_s":{"set":"..."} } ]}
         private async Task<bool> TouchAllDocsScanIdAsync(int projectId, string fileId, string scanId)
         {
-            var ids = await SelectIdsForFileAsync(projectId, fileId);
-            if (ids.Count == 0) return true;
+            var pairs = await SelectIdRootPairsForFileAsync(projectId, fileId);
+            if (pairs.Count == 0) return true;
 
             const int BATCH = 500;
-            for (int i = 0; i < ids.Count; i += BATCH)
+            for (int i = 0; i < pairs.Count; i += BATCH)
             {
-                var docs = ids.Skip(i).Take(BATCH)
-                    .Select(id => new Dictionary<string, object?>
+                var docs = pairs.Skip(i).Take(BATCH)
+                    .Select(p =>
                     {
-                        ["id"] = id,
-                        ["scanId_s"] = new Dictionary<string, object?> { ["set"] = scanId }
+                        var d = new Dictionary<string, object?>
+                        {
+                            ["id"] = p.Id,
+                            ["scanId_s"] = new Dictionary<string, object?> { ["set"] = scanId }
+                        };
+                        // Only include _root_ when present AND different from id (child doc)
+                        if (!string.IsNullOrEmpty(p.Root) && !string.Equals(p.Root, p.Id, StringComparison.Ordinal))
+                            d["_root_"] = p.Root;
+                        return d;
                     })
                     .ToArray();
 
-                var payload = JsonSerializer.Serialize(new Dictionary<string, object?>
-                {
-                    ["add"] = docs
-                });
-
+                var payload = JsonSerializer.Serialize(new Dictionary<string, object?> { ["add"] = docs });
                 var ok = await PostSolrJsonAsync($"{_solrURL}/update", payload, _logger);
                 if (!ok) return false;
             }
