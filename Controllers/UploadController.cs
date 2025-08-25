@@ -1,6 +1,5 @@
 ﻿using Aspose.Words;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Logging;
 using PCNWSolrUploadFiles.Data;
 using System.Security.Cryptography;
 using System.Text;
@@ -16,7 +15,7 @@ namespace PCNWSolrUploadFiles.Controllers
         private readonly PcnwprojectDbContext _dbContext;
         private readonly IConfiguration _configuration;
         private readonly string _fileUploadPath;
-        private readonly string _solrURL; // e.g., http://localhost:8983/solr/pcnw_project
+        private readonly string _solrURL; // e.g., http://localhost:8983/solr/pcnw
         private readonly ILogger<UploadController> _logger;
 
         // Reuse HttpClient across the app domain
@@ -37,26 +36,6 @@ namespace PCNWSolrUploadFiles.Controllers
                 _logger.LogError("SolrURL is not configured. Set AppSettings:SolrURL to your Solr core/collection URL.");
             if (string.IsNullOrWhiteSpace(_fileUploadPath))
                 _logger.LogError("FileUploadPath is not configured. Set AppSettings:FileUploadPath.");
-        }
-
-        // ---------- Logging EventIds ----------
-        private static class Ev
-        {
-            public static readonly EventId RunStart = new(1000, nameof(RunStart));
-            public static readonly EventId ProjectStart = new(1100, nameof(ProjectStart));
-            public static readonly EventId FileStart = new(1200, nameof(FileStart));
-            public static readonly EventId FileTouch = new(1201, nameof(FileTouch));
-            public static readonly EventId FileUploadOk = new(1202, nameof(FileUploadOk));
-            public static readonly EventId FileUploadFail = new(1203, nameof(FileUploadFail));
-            public static readonly EventId PageAdd = new(1210, nameof(PageAdd));
-            public static readonly EventId ProjectSummary = new(1300, nameof(ProjectSummary));
-            public static readonly EventId RunComplete = new(1999, nameof(RunComplete));
-        }
-
-        [System.Diagnostics.Conditional("TRACE")]
-        private void TracePageAdd(string file, int page, long ms)
-        {
-            _logger.LogTrace(Ev.PageAdd, "  └─ Page {page} added from {file} ({ms} ms)", page, file, ms);
         }
 
         /// <summary> One-click reset: deletes ALL documents in the Solr collection and commits. </summary>
@@ -81,435 +60,244 @@ namespace PCNWSolrUploadFiles.Controllers
         }
 
         /// <summary>
-        /// NEW: Purge invalid/empty docs that slipped into Solr (e.g., only id, or missing required fields, or empty content).
-        /// </summary>
-        public async Task<bool> PurgeEmptyOrInvalidDocsAsync() // NEW
-        {
-            try
-            {
-                // Build a conservative set of delete-by-queries. Each one targets a kind of "bad" doc.
-                var queries = new List<string>
-                {
-                    // Missing required fields
-                    "-projectId_i:[* TO *]",
-                    "-fileId_s:[* TO *]",
-                    "-doc_type_s:[* TO *]",
-                    "-filename_s:[* TO *]",
-                    "-relativePath_s:[* TO *]",
-                    "-checksum_s:[* TO *]",
-                    "-scanId_s:[* TO *]",
-
-                    // For pages: missing page_i
-                    "(doc_type_s:page AND -page_i:[* TO *])",
-
-                    // Docs with content_txt explicitly empty string (stored field may hold "")
-                    "content_txt:\"\"",
-
-                    // Docs with no content_txt field at all (keep this **optional**; uncomment if desired)
-                    // "-content_txt:[* TO *]"
-                };
-
-                foreach (var q in queries)
-                {
-                    var payload = JsonSerializer.Serialize(new { delete = new { query = q } });
-                    var ok = await PostSolrJsonAsync($"{_solrURL}/update", payload, _logger);
-                    _logger.LogInformation("Purge query executed: {q} -> {ok}", q, ok);
-                }
-
-                var commitOk = await PostSolrJsonAsync($"{_solrURL}/update?commit=true", "{}", _logger);
-                _logger.LogInformation("Purge commit: {ok}", commitOk);
-                return true;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error during PurgeEmptyOrInvalidDocsAsync.");
-                return false;
-            }
-        }
-
-        /// <summary>
         /// Main indexer: scans folders and sends files to Solr.
         /// - Only uploads when a project folder has supported files.
-        /// - Unchanged files (checksum) => atomic "touch" to set scanId_s (no re-extraction), unless forceReindex=true.
+        /// - Unchanged files (checksum) => atomic "touch" to set scanId_s (no re-extraction).
         /// - New/changed => delete old docs of that fileId, re-add.
         /// - Project-level cleanup deletes only docs that have a scanId_s and don't match this run's scanId (safe).
         /// </summary>
-        public async Task UploadAllFiles(bool forceReindex = false, bool purgeAfter = true) // NEW: forceReindex & purgeAfter
+        public async Task UploadAllFiles()
         {
-            //await ClearSolrAllAsync();
+            await ClearSolrAllAsync();
             var overallStart = DateTime.UtcNow;
-            var runId = Guid.NewGuid().ToString("N");
 
-            using (_logger.BeginScope(new Dictionary<string, object> { ["RunId"] = runId }))
+            try
             {
-                try
+                _logger.LogInformation("Started UploadAllFiles at: {local} ({utc} UTC)", DateTime.Now, DateTime.UtcNow);
+
+                if (string.IsNullOrWhiteSpace(_solrURL))
+                    throw new InvalidOperationException("SolrURL not configured.");
+
+                // Ensure schema once up front (idempotent)
+                var schemaOk = await EnsureSolrSchemaAsync();
+                if (!schemaOk)
                 {
-                    _logger.LogInformation(Ev.RunStart, "UploadAllFiles RUN START at {local} ({utc} UTC)", DateTime.Now, DateTime.UtcNow);
+                    _logger.LogWarning("Could not verify/create schema. Proceeding, but field storage/indexing may be wrong.");
+                }
 
-                    if (string.IsNullOrWhiteSpace(_solrURL))
-                        throw new InvalidOperationException("SolrURL not configured.");
+                var baseDirectory = _fileUploadPath;
+                if (!Directory.Exists(baseDirectory))
+                    throw new DirectoryNotFoundException($"Base directory not found: {baseDirectory}");
 
-                    // Ensure schema once up front (idempotent) — includes making content_txt stored=true
-                    var schemaOk = await EnsureSolrSchemaAsync(); // NEW: will repair content_txt if needed
-                    if (!schemaOk)
-                        _logger.LogWarning("Could not verify/create schema. Proceeding, but field storage/indexing may be wrong.");
-
-                    var baseDirectory = _fileUploadPath;
-                    if (!Directory.Exists(baseDirectory))
-                        throw new DirectoryNotFoundException($"Base directory not found: {baseDirectory}");
-
-                    var yearFolders = Directory.GetDirectories(baseDirectory);
-                    foreach (var yearFolder in yearFolders)
+                var yearFolders = Directory.GetDirectories(baseDirectory);
+                foreach (var yearFolder in yearFolders)
+                {
+                    var monthFolders = Directory.GetDirectories(yearFolder);
+                    foreach (var monthFolder in monthFolders)
                     {
-                        var monthFolders = Directory.GetDirectories(yearFolder);
-                        foreach (var monthFolder in monthFolders)
+                        var projectNumberFolders = Directory.GetDirectories(monthFolder);
+                        foreach (var projectFolder in projectNumberFolders)
                         {
-                            var projectNumberFolders = Directory.GetDirectories(monthFolder);
-                            foreach (var projectFolder in projectNumberFolders)
+                            var swProject = System.Diagnostics.Stopwatch.StartNew();
+                            var projectNumber = Path.GetFileName(projectFolder);
+
+                            // Only index published projects
+                            var projectId = await _dbContext.Projects
+                                .Where(p => p.ProjNumber == projectNumber && (bool)p.Publish!)
+                                .Select(p => p.ProjId)
+                                .FirstOrDefaultAsync();
+
+                            if (projectId == 0)
                             {
-                                var swProject = System.Diagnostics.Stopwatch.StartNew();
-                                var projectNumber = Path.GetFileName(projectFolder);
+                                _logger.LogInformation("Skipping project {projNumber} (unpublished or not found).", projectNumber);
+                                continue;
+                            }
 
-                                // Only index published projects
-                                var projectId = await _dbContext.Projects
-                                    .Where(p => p.ProjNumber == projectNumber && (bool)p.Publish!)
-                                    .Select(p => p.ProjId)
-                                    .FirstOrDefaultAsync();
+                            var allowedExtensions = new[] { ".pdf", ".docx", ".doc", ".txt" };
+                            var files = Directory.EnumerateFiles(projectFolder, "*.*", SearchOption.AllDirectories)
+                                                 .Where(f => allowedExtensions.Contains(Path.GetExtension(f).ToLowerInvariant()))
+                                                 .ToList();
 
-                                if (projectId == 0)
+                            if (files.Count == 0)
+                            {
+                                // SAFER: Do NOT delete existing docs if the folder currently has no files.
+                                _logger.LogInformation("Skipping project {projNumber} (no supported files found). No deletions performed.", projectNumber);
+                                continue;
+                            }
+
+                            _logger.LogInformation("Project {projNumber} (Id {pid}): {count} files.", projectNumber, projectId, files.Count);
+
+                            var scanId = Guid.NewGuid().ToString("N");
+                            int index = 0, newOrUpdated = 0, touched = 0, failed = 0, addedDocs = 0;
+
+                            foreach (var file in files)
+                            {
+                                index++;
+                                try
                                 {
-                                    _logger.LogInformation("Skipping project {projNumber} (unpublished or not found).", projectNumber);
-                                    continue;
-                                }
+                                    var relativePath = GetRelativePath(projectFolder, file).Replace('\\', '/'); // project-relative
+                                    var fileId = Sha1(relativePath); // stable per relative path
+                                    var idBase = $"{projectId}|{fileId}";
 
-                                var allowedExtensions = new[] { ".pdf", ".docx", ".doc", ".txt" };
-                                var files = Directory.EnumerateFiles(projectFolder, "*.*", SearchOption.AllDirectories)
-                                                     .Where(f => allowedExtensions.Contains(Path.GetExtension(f).ToLowerInvariant()))
-                                                     .ToList();
+                                    var checksum = ComputeSHA256(file);
+                                    var existingChecksum = await GetAnyChecksumForFileAsync(projectId, fileId);
 
-                                var projectScope = new Dictionary<string, object>
-                                {
-                                    ["RunId"] = runId,
-                                    ["ProjectId"] = projectId,
-                                    ["ProjNumber"] = projectNumber
-                                };
-
-                                using (_logger.BeginScope(projectScope))
-                                {
-                                    _logger.LogInformation(Ev.ProjectStart,
-                                        "PROJECT START {projNumber} (Id {pid}) with {count} candidate files",
-                                        projectNumber, projectId, files.Count);
-
-                                    if (files.Count == 0)
+                                    if (!string.IsNullOrEmpty(existingChecksum) &&
+                                        string.Equals(existingChecksum, checksum, StringComparison.OrdinalIgnoreCase))
                                     {
-                                        _logger.LogInformation("No supported files; skipping (no deletions).");
+                                        // Unchanged → just touch scanId on all existing docs for this file
+                                        var touchedOk = await TouchAllDocsScanIdAsync(projectId, fileId, scanId);
+                                        if (!touchedOk) { failed++; continue; }
+                                        touched++;
+                                        _logger.LogDebug("[{cur}/{tot}] UNCHANGED touched fileId={fileId}", index, files.Count, fileId);
                                         continue;
                                     }
 
-                                    var scanId = Guid.NewGuid().ToString("N");
-                                    int index = 0, newOrUpdated = 0, touched = 0, failed = 0, addedDocs = 0;
+                                    // Changed/new → delete old docs for this file, then (re)add
+                                    _ = await DeleteByFileIdAsync(projectId, fileId);
 
-                                    foreach (var file in files)
+                                    var info = new FileInfo(file);
+                                    var lastModUtc = info.LastWriteTimeUtc;
+
+                                    // Extract content (per type)
+                                    var ext = Path.GetExtension(file).ToLowerInvariant();
+                                    if (ext == ".pdf")
                                     {
-                                        index++;
-                                        var swFile = System.Diagnostics.Stopwatch.StartNew();
-                                        try
+                                        foreach (var (page, textRaw) in ExtractPdfPages(file))
                                         {
-                                            var relativePath = GetRelativePath(projectFolder, file).Replace('\\', '/'); // project-relative
-                                            var fileId = Sha1(relativePath); // stable per relative path
-                                            var idBase = $"{projectId}|{fileId}";
+                                            var text = CleanAsposeEvaluationNoise(textRaw);
+                                            if (string.IsNullOrWhiteSpace(text)) continue;
 
-                                            var checksum = ComputeSHA256(file);
-                                            var existingChecksum = await GetAnyChecksumForFileAsync(projectId, fileId);
-
-                                            _logger.LogInformation(Ev.FileStart, "[{idx}/{tot}] START file: {file} (fileId={fileId})",
-                                                index, files.Count, relativePath, fileId);
-
-                                            var treatAsChanged =
-                                                forceReindex ||
-                                                string.IsNullOrEmpty(existingChecksum) ||
-                                                !string.Equals(existingChecksum, checksum, StringComparison.OrdinalIgnoreCase);
-
-                                            if (!treatAsChanged)
+                                            var doc = new Dictionary<string, object?>
                                             {
-                                                // unchanged → just touch scanId_s
-                                                var swTouch = System.Diagnostics.Stopwatch.StartNew();
-                                                var touchedOk = await TouchAllDocsScanIdAsync(projectId, fileId, scanId);
-                                                swTouch.Stop();
+                                                ["id"] = $"{idBase}#{page}",
+                                                ["projectId_i"] = projectId,
+                                                ["fileId_s"] = fileId,
+                                                ["doc_type_s"] = "page",
+                                                ["filename_s"] = Path.GetFileName(file),
+                                                ["relativePath_s"] = relativePath,
+                                                ["page_i"] = page,
+                                                ["checksum_s"] = checksum,
+                                                ["fileSize_l"] = info.Length,
+                                                ["lastModified_dt"] = lastModUtc.ToString("o"),
+                                                ["scanId_s"] = scanId,
+                                                ["content_txt"] = text
+                                            };
 
-                                                if (!touchedOk)
-                                                {
-                                                    failed++;
-                                                    _logger.LogError(Ev.FileUploadFail, "[{idx}/{tot}] TOUCH FAILED file: {file} (fileId={fileId}) in {ms} ms",
-                                                        index, files.Count, relativePath, fileId, swTouch.ElapsedMilliseconds);
-                                                }
-                                                else
-                                                {
-                                                    touched++;
-                                                    _logger.LogInformation(Ev.FileTouch, "[{idx}/{tot}] UNCHANGED → touched file: {file} (fileId={fileId}) in {ms} ms",
-                                                        index, files.Count, relativePath, fileId, swTouch.ElapsedMilliseconds);
-                                                }
-
-                                                swFile.Stop();
-                                                continue;
-                                            }
-
-                                            // Changed/new/forced → delete old docs for this file, then (re)add
-                                            _ = await DeleteByFileIdAsync(projectId, fileId);
-
-                                            var info = new FileInfo(file);
-                                            var lastModUtc = info.LastWriteTimeUtc;
-
-                                            var ext = Path.GetExtension(file).ToLowerInvariant();
-                                            int pagesAdded = 0;
-
-                                            if (ext == ".pdf")
-                                            {
-                                                foreach (var (page, textRaw) in ExtractPdfPages(file))
-                                                {
-                                                    var t0 = System.Diagnostics.Stopwatch.StartNew();
-                                                    var text = CleanAsposeEvaluationNoise(textRaw);
-                                                    if (string.IsNullOrWhiteSpace(text)) { t0.Stop(); continue; }
-
-                                                    var doc = new Dictionary<string, object?>
-                                                    {
-                                                        ["id"] = $"{idBase}#{page}",
-                                                        ["projectId_i"] = projectId,
-                                                        ["fileId_s"] = fileId,
-                                                        ["doc_type_s"] = "page",
-                                                        ["filename_s"] = Path.GetFileName(file),
-                                                        ["relativePath_s"] = relativePath,
-                                                        ["page_i"] = page,
-                                                        ["checksum_s"] = checksum,
-                                                        ["fileSize_l"] = info.Length,
-                                                        ["lastModified_dt"] = lastModUtc.ToString("o"),
-                                                        ["scanId_s"] = scanId,
-                                                        ["content_txt"] = text // STORED now after schema fix
-                                                    };
-
-                                                    if (!await AddDocsBatchAsync_One(doc))
-                                                    {
-                                                        failed++;
-                                                        _logger.LogError(Ev.FileUploadFail, "[{idx}/{tot}] Failed adding page {page} for {file}",
-                                                            index, files.Count, page, relativePath);
-                                                        break;
-                                                    }
-                                                    t0.Stop();
-                                                    pagesAdded++;
-                                                    addedDocs++;
-                                                    TracePageAdd(relativePath, page, t0.ElapsedMilliseconds);
-                                                }
-                                            }
-                                            else if (ext == ".docx" || ext == ".doc")
-                                            {
-                                                var t0 = System.Diagnostics.Stopwatch.StartNew();
-                                                var text = ExtractDocAllText(file);
-                                                text = CleanAsposeEvaluationNoise(text);
-                                                if (!string.IsNullOrWhiteSpace(text))
-                                                {
-                                                    var doc = new Dictionary<string, object?>
-                                                    {
-                                                        ["id"] = $"{idBase}#1",
-                                                        ["projectId_i"] = projectId,
-                                                        ["fileId_s"] = fileId,
-                                                        ["doc_type_s"] = "file",
-                                                        ["filename_s"] = Path.GetFileName(file),
-                                                        ["relativePath_s"] = relativePath,
-                                                        ["page_i"] = 1,
-                                                        ["checksum_s"] = checksum,
-                                                        ["fileSize_l"] = info.Length,
-                                                        ["lastModified_dt"] = lastModUtc.ToString("o"),
-                                                        ["scanId_s"] = scanId,
-                                                        ["content_txt"] = text
-                                                    };
-
-                                                    if (!await AddDocsBatchAsync_One(doc))
-                                                    {
-                                                        failed++;
-                                                        _logger.LogError(Ev.FileUploadFail, "[{idx}/{tot}] Failed adding WORD doc {file}",
-                                                            index, files.Count, relativePath);
-                                                    }
-                                                    else
-                                                    {
-                                                        pagesAdded = 1;
-                                                        addedDocs++;
-                                                        TracePageAdd(relativePath, 1, t0.ElapsedMilliseconds);
-                                                    }
-                                                }
-                                            }
-                                            else if (ext == ".txt")
-                                            {
-                                                var t0 = System.Diagnostics.Stopwatch.StartNew();
-                                                var text = File.ReadAllText(file, Encoding.UTF8);
-                                                text = CleanAsposeEvaluationNoise(text);
-                                                if (!string.IsNullOrWhiteSpace(text))
-                                                {
-                                                    var doc = new Dictionary<string, object?>
-                                                    {
-                                                        ["id"] = $"{idBase}#1",
-                                                        ["projectId_i"] = projectId,
-                                                        ["fileId_s"] = fileId,
-                                                        ["doc_type_s"] = "file",
-                                                        ["filename_s"] = Path.GetFileName(file),
-                                                        ["relativePath_s"] = relativePath,
-                                                        ["page_i"] = 1,
-                                                        ["checksum_s"] = checksum,
-                                                        ["fileSize_l"] = info.Length,
-                                                        ["lastModified_dt"] = lastModUtc.ToString("o"),
-                                                        ["scanId_s"] = scanId,
-                                                        ["content_txt"] = text
-                                                    };
-
-                                                    if (!await AddDocsBatchAsync_One(doc))
-                                                    {
-                                                        failed++;
-                                                        _logger.LogError(Ev.FileUploadFail, "[{idx}/{tot}] Failed adding TXT doc {file}",
-                                                            index, files.Count, relativePath);
-                                                    }
-                                                    else
-                                                    {
-                                                        pagesAdded = 1;
-                                                        addedDocs++;
-                                                        TracePageAdd(relativePath, 1, t0.ElapsedMilliseconds);
-                                                    }
-                                                }
-                                            }
-
-                                            swFile.Stop();
-
-                                            if (pagesAdded > 0)
-                                            {
-                                                newOrUpdated++;
-                                                _logger.LogInformation(Ev.FileUploadOk,
-                                                    "[{idx}/{tot}] UPLOADED file: {file} (pages={pages}, docsAdded={docs}, {ms} ms)",
-                                                    index, files.Count, relativePath, pagesAdded, addedDocs, swFile.ElapsedMilliseconds);
-                                            }
-                                            else
-                                            {
-                                                _logger.LogInformation(Ev.FileUploadOk,
-                                                    "[{idx}/{tot}] SKIPPED (no extractable text) file: {file} ({ms} ms)",
-                                                    index, files.Count, relativePath, swFile.ElapsedMilliseconds);
-                                            }
+                                            if (!await AddDocsBatchAsync_One(doc)) { failed++; break; }
+                                            addedDocs++;
                                         }
-                                        catch (Exception ex)
+                                    }
+                                    else if (ext == ".docx" || ext == ".doc")
+                                    {
+                                        // Index as a single file-level doc (Word true per-page splitting requires full Aspose sample)
+                                        var text = ExtractDocAllText(file);
+                                        text = CleanAsposeEvaluationNoise(text);
+                                        if (!string.IsNullOrWhiteSpace(text))
                                         {
-                                            swFile.Stop();
-                                            failed++;
-                                            _logger.LogError(Ev.FileUploadFail, ex, "[{idx}/{tot}] ERROR file: {file} ({ms} ms)",
-                                                index, files.Count, file, swFile.ElapsedMilliseconds);
+                                            var doc = new Dictionary<string, object?>
+                                            {
+                                                ["id"] = $"{idBase}#1",
+                                                ["projectId_i"] = projectId,
+                                                ["fileId_s"] = fileId,
+                                                ["doc_type_s"] = "file",
+                                                ["filename_s"] = Path.GetFileName(file),
+                                                ["relativePath_s"] = relativePath,
+                                                ["page_i"] = 1,
+                                                ["checksum_s"] = checksum,
+                                                ["fileSize_l"] = info.Length,
+                                                ["lastModified_dt"] = lastModUtc.ToString("o"),
+                                                ["scanId_s"] = scanId,
+                                                ["content_txt"] = text
+                                            };
+
+                                            if (!await AddDocsBatchAsync_One(doc)) { failed++; }
+                                            else addedDocs++;
+                                        }
+                                    }
+                                    else if (ext == ".txt")
+                                    {
+                                        var text = File.ReadAllText(file, Encoding.UTF8);
+                                        if (!string.IsNullOrWhiteSpace(text))
+                                        {
+                                            var doc = new Dictionary<string, object?>
+                                            {
+                                                ["id"] = $"{idBase}#1",
+                                                ["projectId_i"] = projectId,
+                                                ["fileId_s"] = fileId,
+                                                ["doc_type_s"] = "file",
+                                                ["filename_s"] = Path.GetFileName(file),
+                                                ["relativePath_s"] = relativePath,
+                                                ["page_i"] = 1,
+                                                ["checksum_s"] = checksum,
+                                                ["fileSize_l"] = info.Length,
+                                                ["lastModified_dt"] = lastModUtc.ToString("o"),
+                                                ["scanId_s"] = scanId,
+                                                ["content_txt"] = text
+                                            };
+
+                                            if (!await AddDocsBatchAsync_One(doc)) { failed++; }
+                                            else addedDocs++;
                                         }
                                     }
 
-                                    // Project-level cleanup: remove docs from earlier runs safely
-                                    var deleteStaleQuery = $"projectId_i:{projectId} AND scanId_s:[* TO *] AND -scanId_s:{scanId}";
-                                    _ = await PostSolrJsonAsync($"{_solrURL}/update",
-                                        JsonSerializer.Serialize(new { delete = new { query = deleteStaleQuery } }), _logger);
-
-                                    // Commit once per project
-                                    _ = await PostSolrJsonAsync($"{_solrURL}/update?commit=true", "{}", _logger);
-
-                                    // Update DB timestamps/flags only if we actually processed files (added or touched)
-                                    if ((newOrUpdated + touched) > 0)
-                                    {
-                                        var project = await _dbContext.Projects.FirstOrDefaultAsync(m => m.ProjId == projectId);
-                                        if (project != null)
-                                        {
-                                            project.IndexPdffiles = false;
-                                            project.SolrIndexDt = DateTime.Now;
-                                            project.SolrIndexPdfdt = DateTime.Now;
-                                            await _dbContext.SaveChangesAsync();
-                                        }
-                                    }
-
-                                    swProject.Stop();
-                                    _logger.LogInformation(Ev.ProjectSummary,
-                                        "PROJECT SUMMARY {proj} → New/Updated={up}, UnchangedTouched={touch}, Failed={fail}, DocsAdded={docs}, Elapsed={ms}ms",
-                                        projectNumber, newOrUpdated, touched, failed, addedDocs, swProject.ElapsedMilliseconds);
+                                    if (failed == 0) newOrUpdated++;
+                                }
+                                catch (Exception ex)
+                                {
+                                    failed++;
+                                    _logger.LogError(ex, "[{cur}/{tot}] Error indexing file: {file}", index, files.Count, file);
                                 }
                             }
+
+                            // Project-level cleanup: remove docs from earlier runs safely
+                            // IMPORTANT: only delete docs that HAVE a scanId_s at all (otherwise, old docs with no scanId_s would be wiped)
+                            var deleteStaleQuery = $"projectId_i:{projectId} AND doc_type_s:[* TO *] AND scanId_s:[* TO *] AND -scanId_s:{scanId}";
+                            _ = await PostSolrJsonAsync($"{_solrURL}/update",
+                                JsonSerializer.Serialize(new { delete = new { query = deleteStaleQuery } }), _logger);
+
+                            // Commit once per project
+                            _ = await PostSolrJsonAsync($"{_solrURL}/update?commit=true", "{}", _logger);
+
+                            // Update DB timestamps/flags only if we actually processed files (added or touched)
+                            if ((newOrUpdated + touched) > 0)
+                            {
+                                var project = await _dbContext.Projects.FirstOrDefaultAsync(m => m.ProjId == projectId);
+                                if (project != null)
+                                {
+                                    project.IndexPdffiles = false;
+                                    project.SolrIndexDt = DateTime.Now;
+                                    project.SolrIndexPdfdt = DateTime.Now;
+                                    await _dbContext.SaveChangesAsync();
+                                }
+                            }
+
+                            swProject.Stop();
+                            _logger.LogInformation("PROJECT {proj} SUMMARY: New/Updated={up}, UnchangedTouched={touch}, Failed={fail}, AddedDocs={docs}, Elapsed={ms}ms",
+                                projectNumber, newOrUpdated, touched, failed, addedDocs, swProject.ElapsedMilliseconds);
                         }
                     }
-
-                    // Optional: one final purge across the core after indexing
-                    if (purgeAfter)
-                    {
-                        await PurgeEmptyOrInvalidDocsAsync(); // NEW
-                    }
-
-                    var elapsed = DateTime.UtcNow - overallStart;
-                    _logger.LogInformation(Ev.RunComplete, "RUN COMPLETE in {ms} ms (RunId={runId})", (long)elapsed.TotalMilliseconds, runId);
                 }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "An error occurred while uploading files (RunId={runId})", runId);
-                    throw;
-                }
+
+                var elapsed = DateTime.UtcNow - overallStart;
+                _logger.LogInformation("Completed UploadAllFiles. Elapsed: {ms} ms", (long)elapsed.TotalMilliseconds);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "An error occurred while uploading files");
+                throw;
             }
         }
 
-        // ---------- Solr schema bootstrap & repairs ----------
-
-        private sealed record FieldDef(string name, string type, bool stored, bool indexed);
-        private sealed record SolrFieldInfo(string name, string type, bool stored, bool indexed); // NEW
-
-        private async Task<SolrFieldInfo?> GetFieldAsync(string fieldName) // NEW
-        {
-            try
-            {
-                var url = $"{_solrURL}/schema/fields/{Uri.EscapeDataString(fieldName)}?wt=json";
-                var resp = await _http.GetAsync(url);
-                if (!resp.IsSuccessStatusCode) return null;
-
-                using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
-                if (doc.RootElement.TryGetProperty("field", out var f))
-                {
-                    return new SolrFieldInfo(
-                        f.GetProperty("name").GetString()!,
-                        f.GetProperty("type").GetString()!,
-                        f.GetProperty("stored").GetBoolean(),
-                        f.GetProperty("indexed").GetBoolean()
-                    );
-                }
-                return null;
-            }
-            catch
-            {
-                return null;
-            }
-        }
-
-        private async Task<bool> ReplaceField_ContentTxt_ToStoredAsync(bool useFastVector = false) // NEW
-        {
-            var field = new Dictionary<string, object?>
-            {
-                ["name"] = "content_txt",
-                ["type"] = "text_general",
-                ["stored"] = true,
-                ["indexed"] = true,
-                ["multiValued"] = false
-            };
-
-            // If you plan to use Fast Vector Highlighter later, enable term vectors and reindex
-            if (useFastVector)
-            {
-                field["termVectors"] = true;
-                field["termPositions"] = true;
-                field["termOffsets"] = true;
-            }
-
-            var payload = JsonSerializer.Serialize(new Dictionary<string, object?>
-            {
-                ["replace-field"] = field
-            });
-
-            return await PostSolrJsonAsync($"{_solrURL}/schema", payload, _logger);
-        }
-
+        // ---------------------------
+        // Solr SCHEMA bootstrap (idempotent)
+        // ---------------------------
+        private record FieldDef(string name, string type, bool stored, bool indexed);
         private async Task<bool> EnsureSolrSchemaAsync()
         {
             try
             {
-                // 1) Get existing fields (plain list)
+                // 1) Get existing fields
                 var fieldsUrl = $"{_solrURL}/schema/fields?includeDynamic=true&wt=json";
                 var resp = await _http.GetAsync(fieldsUrl);
                 if (!resp.IsSuccessStatusCode) return false;
@@ -527,72 +315,46 @@ namespace PCNWSolrUploadFiles.Controllers
                     }
                 }
 
-                // Ensure typed fields (adjust pint/plong vs int/long according to your core)
                 var need = new List<FieldDef>
-                {
-                    new("projectId_i","pint", stored:true, indexed:true),
-                    new("fileId_s","string", stored:true, indexed:true),
-                    new("doc_type_s","string", stored:true, indexed:true),
-                    new("filename_s","string", stored:true, indexed:true),
-                    new("relativePath_s","string", stored:true, indexed:true),
-                    new("page_i","pint", stored:true, indexed:true),
-                    new("checksum_s","string", stored:true, indexed:true),
-                    new("fileSize_l","plong", stored:true, indexed:true),
-                    new("lastModified_dt","pdate", stored:true, indexed:true),
-                    new("scanId_s","string", stored:true, indexed:true)
-                    // content_txt handled separately below to guarantee stored=true + text_general
-                };
+        {
+            new("projectId_i","pint", stored:true, indexed:true),
+            new("fileId_s","string", stored:true, indexed:true),
+            new("doc_type_s","string", stored:true, indexed:true),
+            new("filename_s","string", stored:true, indexed:true),
+            new("relativePath_s","string", stored:true, indexed:true),
+            new("page_i","pint", stored:true, indexed:true),
+            new("checksum_s","string", stored:true, indexed:true),
+            new("fileSize_l","plong", stored:true, indexed:true),
+            new("lastModified_dt","pdate", stored:true, indexed:true),
+            new("scanId_s","string", stored:true, indexed:true),
+            new("content_txt","text_general", stored:false, indexed:true)
+        };
 
                 var toAdd = need.Where(n => !existing.Contains(n.name)).ToList();
-                if (toAdd.Count > 0)
-                {
-                    var addPayload = new Dictionary<string, object?>
-                    {
-                        ["add-field"] = toAdd
-                            .Select(f => new Dictionary<string, object?>
-                            {
-                                ["name"] = f.name,
-                                ["type"] = f.type,
-                                ["stored"] = f.stored,
-                                ["indexed"] = f.indexed,
-                                ["multiValued"] = false
-                            })
-                            .ToArray()
-                    };
-                    var addResp = await PostSolrJsonAsync($"{_solrURL}/schema", JsonSerializer.Serialize(addPayload), _logger);
-                    if (!addResp) _logger.LogWarning("Schema add-field returned non-success for base fields.");
-                }
+                if (toAdd.Count == 0) return true;
 
-                // 2) Guarantee content_txt is stored:true and analyzed
-                var current = await GetFieldAsync("content_txt");
-                if (current is null)
+                // 2) Build payload via dictionary (NOT an anonymous type)
+                var addPayload = new Dictionary<string, object?>
                 {
-                    var addContent = new Dictionary<string, object?>
-                    {
-                        ["add-field"] = new object[]
+                    ["add-field"] = toAdd
+                        .Select(f => new Dictionary<string, object?>
                         {
-                            new Dictionary<string, object?>
-                            {
-                                ["name"] = "content_txt",
-                                ["type"] = "text_general",
-                                ["stored"] = true,
-                                ["indexed"] = true,
-                                ["multiValued"] = false
-                            }
-                        }
-                    };
-                    var ok = await PostSolrJsonAsync($"{_solrURL}/schema", JsonSerializer.Serialize(addContent), _logger);
-                    if (!ok) _logger.LogWarning("Failed to add content_txt as stored=true, text_general.");
-                }
-                else
+                            ["name"] = f.name,
+                            ["type"] = f.type,
+                            ["stored"] = f.stored,
+                            ["indexed"] = f.indexed,
+                            ["multiValued"] = false
+                        })
+                        .ToArray()
+                };
+
+                // 3) POST to /schema
+                var content = new StringContent(JsonSerializer.Serialize(addPayload), Encoding.UTF8, "application/json");
+                var addResp = await _http.PostAsync($"{_solrURL}/schema", content);
+                if (!addResp.IsSuccessStatusCode)
                 {
-                    if (!current.stored || !string.Equals(current.type, "text_general", StringComparison.OrdinalIgnoreCase))
-                    {
-                        _logger.LogInformation("Fixing content_txt schema (stored={stored}, type={type}) → stored=true, text_general.",
-                            current.stored, current.type);
-                        var ok = await ReplaceField_ContentTxt_ToStoredAsync(useFastVector: false);
-                        if (!ok) _logger.LogWarning("replace-field for content_txt failed.");
-                    }
+                    var body = await SafeReadAsync(addResp);
+                    _logger.LogWarning("Schema add-field returned {code}: {body}", (int)addResp.StatusCode, body);
                 }
 
                 return true;
@@ -604,15 +366,15 @@ namespace PCNWSolrUploadFiles.Controllers
             }
         }
 
-        // ---------- Solr helpers (add/touch/delete/select) ----------
 
-        // Simple single-doc add (keeps payloads small & robust)
+        // ---------------------------
+        // Solr helpers (add, touch, delete, select)
+        // ---------------------------
+
+        // Small buffered adder to avoid huge payloads; this variant adds one at a time (simple & safe).
         private async Task<bool> AddDocsBatchAsync_One(Dictionary<string, object?> doc, int maxRetries = 3)
         {
-            var payload = JsonSerializer.Serialize(new Dictionary<string, object?>
-            {
-                ["add"] = new[] { new Dictionary<string, object?> { ["doc"] = doc } }
-            });
+            var payload = JsonSerializer.Serialize(new Dictionary<string, object?> { ["add"] = new[] { new Dictionary<string, object?> { ["doc"] = doc } } });
             return await PostSolrJsonAsync($"{_solrURL}/update", payload, _logger, maxRetries);
         }
 
@@ -742,7 +504,9 @@ namespace PCNWSolrUploadFiles.Controllers
             catch { return "<unreadable>"; }
         }
 
-        // ---------- Extraction helpers ----------
+        // ---------------------------
+        // Extraction helpers
+        // ---------------------------
 
         private IEnumerable<(int page, string text)> ExtractPdfPages(string path)
         {
@@ -790,6 +554,7 @@ namespace PCNWSolrUploadFiles.Controllers
             }
         }
 
+        // Best-effort open with salvage
         private bool TryOpenPdfWithSalvage(string path, out PdfDocument pdf, out string tempSalvaged)
         {
             pdf = null!;
@@ -872,10 +637,13 @@ namespace PCNWSolrUploadFiles.Controllers
         private static string ExtractDocAllText(string path)
         {
             var doc = new Aspose.Words.Document(path);
+            // No per-page split (see comment), just full text:
             return doc.ToString(SaveFormat.Text);
         }
 
-        // ---------- Utilities ----------
+        // ---------------------------
+        // Cleanup & utilities
+        // ---------------------------
 
         private static readonly Regex[] AsposeEvalNoise =
         {
