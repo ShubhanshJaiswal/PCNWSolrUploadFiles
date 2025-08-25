@@ -571,7 +571,7 @@ namespace PCNWSolrUploadFiles.Controllers
             while (true)
             {
                 var url = $"{_solrURL}/select?q=projectId_i:{projectId}%20AND%20fileId_s:{fileId}" +
-                          $"&fl=id,_root_&rows={ROWS}&sort=id%20asc&cursorMark={Uri.EcapeDataString(cursor)}&wt=json";
+                          $"&fl=id,_root_&rows={ROWS}&sort=id%20asc&cursorMark={Uri.EscapeDataString(cursor)}&wt=json";
                 var resp = await _http.GetAsync(url);
                 if (!resp.IsSuccessStatusCode) break;
 
