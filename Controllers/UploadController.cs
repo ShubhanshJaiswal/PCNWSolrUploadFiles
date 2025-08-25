@@ -68,7 +68,7 @@ namespace PCNWSolrUploadFiles.Controllers
         /// Indexer:
         /// - Scans BASE\YYYY\MM\{ProjectNumber}\...
         /// - Adds page-wise PDF, whole-file DOC/DOCX/TXT
-        /// - Unchanged files: "touch" scanId_s (safe for nested cores)
+        /// - Unchanged files: "touch" scanId_s (safe & exception-free)
         /// - Cleanup: deletes stale docs only for files we actually processed in this run
         /// </summary>
         public async Task UploadAllFiles()
@@ -147,13 +147,13 @@ namespace PCNWSolrUploadFiles.Controllers
                                     if (!string.IsNullOrEmpty(existingChecksum) &&
                                         string.Equals(existingChecksum, checksum, StringComparison.OrdinalIgnoreCase))
                                     {
-                                        // UNCHANGED: "touch" (atomic preferred; safe fallbacks built-in)
+                                        // UNCHANGED: "touch" (exception-free; no _root_ usage anywhere)
                                         var touchedOk = await TouchAllDocsScanIdAsync(projectId, fileId, scanId);
                                         if (!touchedOk)
                                         {
                                             fileSucceeded = false;
                                             failed++;
-                                            _logger.LogWarning("[{cur}/{tot}] Touch failed for fileId={fileId}", index, files.Count, fileId);
+                                            _logger.LogInformation("[{cur}/{tot}] Touch skipped or partial for fileId={fileId} (safe no-op).", index, files.Count, fileId);
                                         }
                                         else
                                         {
@@ -296,7 +296,7 @@ namespace PCNWSolrUploadFiles.Controllers
         }
 
         // ---------------------------
-        // Schema bootstrap (idempotent; DO NOT mutate _root_)
+        // Schema bootstrap (idempotent; never mutate _root_)
         // ---------------------------
 
         private record FieldDef(string name, string type, bool stored, bool indexed);
@@ -322,7 +322,6 @@ namespace PCNWSolrUploadFiles.Controllers
                     }
                 }
 
-                // we only ADD missing fields; we DO NOT replace _root_ (some cores forbid changing its props)
                 var need = new List<FieldDef>
                 {
                     new("projectId_i","pint", stored:true, indexed:true),
@@ -335,7 +334,7 @@ namespace PCNWSolrUploadFiles.Controllers
                     new("fileSize_l","plong", stored:true, indexed:true),
                     new("lastModified_dt","pdate", stored:true, indexed:true),
                     new("scanId_s","string", stored:true, indexed:true),
-                    new("content_txt","text_general", stored:true, indexed:true) // FVH-ready; if exists we won't change flags
+                    new("content_txt","text_general", stored:true, indexed:true)
                 };
 
                 var toAdd = need.Where(n => !existing.Contains(n.name)).ToList();
@@ -364,9 +363,7 @@ namespace PCNWSolrUploadFiles.Controllers
                     }
                 }
 
-                // IMPORTANT: we DO NOT touch existing "_root_" field at all.
-                // (Altering docValues/stored/indexed for _root_ on a live core can cause the exact error you saw.)
-
+                // DO NOT touch existing "_root_".
                 return true;
             }
             catch (Exception ex)
@@ -412,47 +409,36 @@ namespace PCNWSolrUploadFiles.Controllers
             catch { return string.Empty; }
         }
 
-        // --- Touch logic that survives nested cores and schema quirks ---
+        // ---- Touch logic: no _root_ atomic updates (avoids DV mismatch entirely)
 
         private async Task<bool> TouchAllDocsScanIdAsync(int projectId, string fileId, string scanId)
         {
-            // 1) Get doc IDs for this file
             var ids = await SelectIdsForFileAsync(projectId, fileId);
             if (ids.Count == 0) return true;
 
-            // 2) Try ATOMIC without _root_ (works on flat cores)
-            if (await TryAtomicTouch(ids, scanId)) return true;
+            // First try atomic update WITHOUT _root_ (works on simple/top-level docs)
+            var atomicAny = await TryAtomicTouch(ids, scanId);
 
-            // 3) If Solr demanded _root_, fetch (id,_root_) pairs (best-effort)
+            // Identify which docs are top-level vs child; we only full-replace top-level/unknown.
             var pairs = await SelectIdRootPairsForFileAsync(projectId, fileId);
+            var topLevelOrUnknown = pairs
+                .Where(p => string.IsNullOrEmpty(p.Root) || string.Equals(p.Id, p.Root, StringComparison.Ordinal))
+                .Select(p => p.Id)
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
 
-            // split into probable children (root present and different) vs top-level
-            var withRoot = pairs.Where(p => !string.IsNullOrEmpty(p.Root) && !string.Equals(p.Id, p.Root, StringComparison.Ordinal)).ToList();
-            var topLevelOrUnknown = ids.Except(withRoot.Select(p => p.Id)).ToList();
+            var fullReplaceOk = topLevelOrUnknown.Count == 0 || await TryFullReplaceTouch(topLevelOrUnknown, scanId);
 
-            // 3a) Try ATOMIC again for child docs WITH _root_
-            if (withRoot.Count > 0)
-            {
-                if (!await TryAtomicTouchWithRoot(withRoot, scanId))
-                {
-                    // If atomic fails even with _root_, we can't safely update children → give up on them
-                    _logger.LogWarning("Atomic touch failed for some child docs (projectId={pid}, fileId={fid}). They will remain untouched this run.", projectId, fileId);
-                }
-            }
+            // If there are any child docs (Root present and different), we purposely do NOT touch them
+            // to avoid ever sending _root_. In that case we deem the touch incomplete.
+            var hasChildren = pairs.Any(p => !string.IsNullOrEmpty(p.Root) && !string.Equals(p.Id, p.Root, StringComparison.Ordinal));
 
-            // 3b) For top-level/unknown (root==id or missing root), try FULL REPLACE via RTG, but NEVER send _root_
-            if (topLevelOrUnknown.Count > 0)
-            {
-                if (!await TryFullReplaceTouch(topLevelOrUnknown, scanId))
-                {
-                    _logger.LogWarning("Full-replace touch failed for some top-level docs (projectId={pid}, fileId={fid}).", projectId, fileId);
-                    // We still consider the overall touch OK if at least one path succeeded; caller will decide per-file.
-                }
-            }
+            // Return true only if:
+            //  - No children exist, and
+            //  - Either atomic (no-root) succeeded or full-replace on top-level succeeded.
+            if (hasChildren) return false;
 
-            // If at least one of the paths succeeded for at least one id, call it success
-            // (We don't want to wipe the file on cleanup if anything succeeded.)
-            return true;
+            return atomicAny || fullReplaceOk;
         }
 
         private async Task<bool> TryAtomicTouch(List<string> ids, string scanId)
@@ -474,40 +460,17 @@ namespace PCNWSolrUploadFiles.Controllers
                 var (ok, status, body) = await PostSolrJsonAsyncDetailed($"{_solrURL}/update", payload, _logger);
                 if (!ok)
                 {
-                    // If Solr is explicitly complaining about missing _root_, bail so caller can try with _root_
-                    if (status == 400 && body.IndexOf("_root_", StringComparison.OrdinalIgnoreCase) >= 0)
-                        return false;
+                    // If Solr complains (e.g., about missing _root_), just bail; we won't escalate to any _root_-based path.
+                    _logger.LogDebug("Atomic touch (no-root) skipped batch; status={status}, body={body}", status, body);
                 }
                 else anyOk = true;
             }
             return anyOk;
         }
 
-        private async Task<bool> TryAtomicTouchWithRoot(List<(string Id, string? Root)> idRootPairs, string scanId)
-        {
-            const int BATCH = 400;
-            bool anyOk = false;
-
-            for (int i = 0; i < idRootPairs.Count; i += BATCH)
-            {
-                var docs = idRootPairs.Skip(i).Take(BATCH)
-                    .Select(p => new Dictionary<string, object?>
-                    {
-                        ["id"] = p.Id,
-                        ["_root_"] = p.Root, // include parent id so Solr accepts child atomic update
-                        ["scanId_s"] = new Dictionary<string, object?> { ["set"] = scanId }
-                    }).ToArray();
-
-                var payload = JsonSerializer.Serialize(new Dictionary<string, object?> { ["add"] = docs });
-                var (ok, _, _) = await PostSolrJsonAsyncDetailed($"{_solrURL}/update", payload, _logger);
-                if (ok) anyOk = true;
-            }
-            return anyOk;
-        }
-
         private async Task<bool> TryFullReplaceTouch(List<string> ids, string scanId)
         {
-            // RTG docs, set scanId_s, strip _version_, DO NOT send _root_
+            // RTG docs, set scanId_s, strip _version_ and _root_ (never send _root_)
             const int BATCH = 300;
             bool anyOk = false;
 
@@ -521,12 +484,16 @@ namespace PCNWSolrUploadFiles.Controllers
                 {
                     d["scanId_s"] = scanId;
                     d.Remove("_version_");
-                    d.Remove("_root_"); // IMPORTANT: never include _root_ in full replace (prevents the error you saw)
+                    d.Remove("_root_"); // never include
                 }
 
                 var payload = JsonSerializer.Serialize(new Dictionary<string, object?> { ["add"] = docs });
-                var (ok, _, _) = await PostSolrJsonAsyncDetailed($"{_solrURL}/update", payload, _logger);
-                if (ok) anyOk = true;
+                var (ok, _, body) = await PostSolrJsonAsyncDetailed($"{_solrURL}/update", payload, _logger);
+                if (!ok)
+                {
+                    _logger.LogDebug("Full-replace touch batch skipped; body={body}", body);
+                }
+                else anyOk = true;
             }
 
             return anyOk;
@@ -598,7 +565,6 @@ namespace PCNWSolrUploadFiles.Controllers
 
         private async Task<List<Dictionary<string, object?>>> RealTimeGetDocsAsync(List<string> ids)
         {
-            // Ask RTG for all fields; if _root_ is stored on that core you'll get it, but we remove it before adding back
             var url = $"{_solrURL}/get?fl={Uri.EscapeDataString("*")}&wt=json";
             var payload = JsonSerializer.Serialize(new { ids = ids });
             var resp = await _http.PostAsync(url, new StringContent(payload, Encoding.UTF8, "application/json"));
@@ -644,8 +610,7 @@ namespace PCNWSolrUploadFiles.Controllers
         {
             if (processedFileIds.Count == 0) return;
 
-            // Build batched queries: projectId_i:X AND fileId_s:(id1 OR id2 ...) AND scanId_s:[* TO *] AND -scanId_s:SCAN
-            const int MAX_PER_BATCH = 100; // keep boolean clauses sane
+            const int MAX_PER_BATCH = 100;
             var fileIds = processedFileIds.ToList();
 
             for (int i = 0; i < fileIds.Count; i += MAX_PER_BATCH)
