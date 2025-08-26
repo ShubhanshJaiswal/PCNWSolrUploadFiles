@@ -66,13 +66,13 @@ namespace PCNWSolrUploadFiles.Controllers
                 if (!Directory.Exists(baseDir))
                     throw new DirectoryNotFoundException($"Base directory not found: {baseDir}");
 
-                var yearFolders = Directory.GetDirectories(baseDir).Where(m => Path.GetFileName(m) == "2025");
+                var yearFolders = Directory.GetDirectories(baseDir)/*.Where(m => Path.GetFileName(m) == "2025")*/;
                 foreach (var yearFolder in yearFolders)
                 {
-                    var monthFolders = Directory.GetDirectories(yearFolder).Where(m => Path.GetFileName(m) == "07");
+                    var monthFolders = Directory.GetDirectories(yearFolder)/*.Where(m => Path.GetFileName(m) == "07")*/;
                     foreach (var monthFolder in monthFolders)
                     {
-                        var projectFolders = Directory.GetDirectories(monthFolder).Where(m => Path.GetFileName(m) == "25070103");
+                        var projectFolders = Directory.GetDirectories(monthFolder/*).Where(m => Path.GetFileName(m) == "25070103")*/;
                         foreach (var projectFolder in projectFolders)
                         {
                             var sw = System.Diagnostics.Stopwatch.StartNew();
