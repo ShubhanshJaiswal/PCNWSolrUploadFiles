@@ -66,13 +66,13 @@ namespace PCNWSolrUploadFiles.Controllers
                 if (!Directory.Exists(baseDir))
                     throw new DirectoryNotFoundException($"Base directory not found: {baseDir}");
 
-                var yearFolders = Directory.GetDirectories(baseDir)/*.Where(m=>Path.GetFileName(m)=="2024")*/;
+                var yearFolders = Directory.GetDirectories(baseDir).Where(m => Path.GetFileName(m) == "2025");
                 foreach (var yearFolder in yearFolders)
                 {
-                    var monthFolders = Directory.GetDirectories(yearFolder);
+                    var monthFolders = Directory.GetDirectories(yearFolder).Where(m => Path.GetFileName(m) == "07");
                     foreach (var monthFolder in monthFolders)
                     {
-                        var projectFolders = Directory.GetDirectories(monthFolder);
+                        var projectFolders = Directory.GetDirectories(monthFolder).Where(m => Path.GetFileName(m) == "25070103");
                         foreach (var projectFolder in projectFolders)
                         {
                             var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -122,26 +122,35 @@ namespace PCNWSolrUploadFiles.Controllers
                                     var checksum = ComputeSHA256(file);
                                     var existingChecksum = await GetAnyChecksumForFileAsync(projectId, fileId);
 
+                                    //if (!string.IsNullOrEmpty(existingChecksum) &&
+                                    //    string.Equals(existingChecksum, checksum, StringComparison.OrdinalIgnoreCase))
+                                    //{
+                                    //    // UNCHANGED: "touch" scanId_s (safe; no _root_ used)
+                                    //    var touchedOk = await TouchAllDocsScanIdAsync(projectId, fileId, scanId);
+                                    //    if (!touchedOk)
+                                    //    {
+                                    //        // If we couldn't touch (e.g., child docs existed), log but don't fail hard.
+                                    //        _logger.LogInformation("[{cur}/{tot}] Touch partial/no-op for fileId={fileId}", index, files.Count, fileId);
+                                    //    }
+                                    //    else
+                                    //    {
+                                    //        touched++;
+                                    //        _logger.LogDebug("[{cur}/{tot}] UNCHANGED touched fileId={fileId}", index, files.Count, fileId);
+                                    //    }
+
+                                    //    processedFileIds.Add(fileId);
+                                    //    continue;
+                                    //}
                                     if (!string.IsNullOrEmpty(existingChecksum) &&
                                         string.Equals(existingChecksum, checksum, StringComparison.OrdinalIgnoreCase))
                                     {
-                                        // UNCHANGED: "touch" scanId_s (safe; no _root_ used)
-                                        var touchedOk = await TouchAllDocsScanIdAsync(projectId, fileId, scanId);
-                                        if (!touchedOk)
-                                        {
-                                            // If we couldn't touch (e.g., child docs existed), log but don't fail hard.
-                                            _logger.LogInformation("[{cur}/{tot}] Touch partial/no-op for fileId={fileId}", index, files.Count, fileId);
-                                        }
-                                        else
-                                        {
-                                            touched++;
-                                            _logger.LogDebug("[{cur}/{tot}] UNCHANGED touched fileId={fileId}", index, files.Count, fileId);
-                                        }
+                                        // UNCHANGED: do not touch Solr at all; just log and skip.
+                                        touched++;
+                                        _logger.LogDebug("[{cur}/{tot}] UNCHANGED skip-touch fileId={fileId}", index, files.Count, fileId);
 
-                                        processedFileIds.Add(fileId);
+                                        // IMPORTANT: DO NOT add to processedFileIds. Cleanup must only run for files we reindexed.
                                         continue;
                                     }
-
                                     // CHANGED/NEW: delete then re-add fresh docs
                                     _ = await DeleteByFileIdAsync(projectId, fileId);
 
@@ -390,31 +399,48 @@ namespace PCNWSolrUploadFiles.Controllers
 
         private async Task<bool> TouchAllDocsScanIdAsync(int projectId, string fileId, string scanId)
         {
-            var ids = await SelectIdsForFileAsync(projectId, fileId);
-            if (ids.Count == 0) return true;
-
-            // Try atomic update WITHOUT _root_ first
-            var atomicAny = await TryAtomicTouch(ids, scanId);
-
-            // Identify top-level/unknown (id==_root_ or _root_ missing)
+            // Get (id, _root_) pairs up front so we can separate top-level vs child docs
             var pairs = await SelectIdRootPairsForFileAsync(projectId, fileId);
-            var topLevelOrUnknown = pairs
+            if (pairs.Count == 0) return true;
+
+            // Top-level or unknown-root docs (safe for atomic update without specifying _root_)
+            var topLevelOrUnknownIds = pairs
                 .Where(p => string.IsNullOrEmpty(p.Root) || string.Equals(p.Id, p.Root, StringComparison.Ordinal))
                 .Select(p => p.Id)
                 .Distinct(StringComparer.Ordinal)
                 .ToList();
 
-            var fullReplaceOk = topLevelOrUnknown.Count == 0 || await TryFullReplaceTouch(topLevelOrUnknown, scanId);
+            // Child docs (have a non-empty _root_ different from id) – skip touching these to avoid the error
+            var childIds = pairs
+                .Where(p => !string.IsNullOrEmpty(p.Root) && !string.Equals(p.Id, p.Root, StringComparison.Ordinal))
+                .Select(p => p.Id)
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
 
-            // If any child docs exist we skip them (never send _root_)—return false so caller logs partial touch.
-            var hasChildren = pairs.Any(p => !string.IsNullOrEmpty(p.Root) && !string.Equals(p.Id, p.Root, StringComparison.Ordinal));
-            if (hasChildren) return false;
+            bool atomicOk = true;
+            if (topLevelOrUnknownIds.Count > 0)
+            {
+                atomicOk = await TryAtomicTouch(topLevelOrUnknownIds, scanId);
+            }
 
-            return atomicAny || fullReplaceOk;
+            // Optionally, you could RTG + full-replace for top-level docs as a fallback.
+            // We DO NOT touch child docs at all to avoid needing to send _root_.
+            if (childIds.Count > 0)
+            {
+                _logger.LogInformation("Skipping touch for {count} child docs for fileId={fileId} to avoid _root_ atomic error.",
+                    childIds.Count, fileId);
+                // return false to let caller log 'partial/no-op' if you want that behavior
+                return false;
+            }
+
+            return atomicOk;
         }
+
 
         private async Task<bool> TryAtomicTouch(List<string> ids, string scanId)
         {
+            if (ids == null || ids.Count == 0) return true;
+
             const int BATCH = 500;
             bool anyOk = false;
 
@@ -432,7 +458,7 @@ namespace PCNWSolrUploadFiles.Controllers
                 var (ok, _, body) = await PostSolrJsonAsyncDetailed($"{_solrURL}/update", payload, _logger);
                 if (!ok)
                 {
-                    _logger.LogDebug("Atomic touch (no-root) batch skipped; body={body}", body);
+                    _logger.LogDebug("Atomic touch batch skipped; body={body}", body);
                 }
                 else anyOk = true;
             }
